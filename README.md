@@ -11,7 +11,7 @@
 ## 安装 Tesseract OCR
 
 1. 下载 Tesseract OCR 安装包：
-https://github.com/tesseract-ocr/tesseract/releases/
+https://github.com/UB-Mannheim/tesseract/wiki
 2. 安装时勾选 **Chinese Simplified** 语言包
 3. 在程序界面中修改 Tesseract 路径
 
