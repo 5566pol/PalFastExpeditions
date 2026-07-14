@@ -27,5 +27,5 @@ https://github.com/tesseract-ocr/tesseract/releases/
 
 程序运行时会在 `screenshots/` 目录保存截图，也提供了清洁按钮
 
-# 目前因为要提高Tesseract的识别所以速度慢，是否再优化取决于我的懒惰程度 Ciallo~(=•ω＜=)ρ⌒☆
-# 有问题请反馈到xiyun_nmsl@qq.com
+### 目前因为要提高Tesseract的识别所以速度慢，是否再优化取决于我的懒惰程度 Ciallo~(=•ω＜=)ρ⌒☆
+### 有问题请反馈到xiyun_nmsl@qq.com
