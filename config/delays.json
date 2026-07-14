@@ -1,0 +1,17 @@
+{
+    "delays": {
+        "pre_action": 0.3,
+        "post_screenshot": 0.5,
+        "detection_retry": 1.0,
+        "scroll_wait": 0.5,
+        "click_move": 0.2,
+        "post_click": 0.5,
+        "step7_dispatch_wait": 1.0,
+        "step10_pre_f": 0.8,
+        "step12_detect_wait": 1.0,
+        "step12_reward_wait": 1.0,
+        "step12_close_wait": 0.5,
+        "time_restore_wait": 0.5
+    },
+    "hotkey": "page_down"
+}
