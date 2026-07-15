@@ -1,6 +1,9 @@
 opencv-python>=4.8.0,<5.0.0
-pytesseract>=0.3.10
 pyautogui>=0.9.54
 pynput>=1.7.6
 Pillow>=10.0.0
 numpy>=1.24.0
+rapidocr_onnxruntime>=1.4.0
+onnxruntime-directml>=1.20.0
+PyYAML>=6.0
+pyinstaller>=6.0

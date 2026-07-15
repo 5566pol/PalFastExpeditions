@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ============================================
-echo   PalFastExpeditions v0.1-beta - 构建脚本
+echo   PalFastExpeditions v0.2-beta - 构建脚本
 echo ============================================
 echo.
 
@@ -33,9 +33,12 @@ venv\Scripts\pyinstaller.exe ^
     --windowed ^
     --name "PalFastExpeditions" ^
     --add-data "config;config" ^
+    --add-data "venv\Lib\site-packages\rapidocr_onnxruntime;rapidocr_onnxruntime" ^
     --hidden-import "pynput.keyboard._win32" ^
     --hidden-import "pynput.mouse._win32" ^
     --hidden-import "pynput._util.win32" ^
+    --hidden-import "rapidocr_onnxruntime" ^
+    --hidden-import "onnxruntime" ^
     main.py
 
 if errorlevel 1 (

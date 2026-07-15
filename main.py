@@ -1,6 +1,6 @@
 """
 PalFastExpeditions - 帕鲁远征自动化工具
-使用 OpenCV + Tesseract OCR + PyAutoGUI 实现屏幕文字识别与自动点击
+使用 OpenCV + RapidOCR + PyAutoGUI 实现屏幕文字识别与自动点击
 """
 
 import ctypes
@@ -17,7 +17,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 import pyautogui
-import pytesseract
+from rapidocr_onnxruntime import RapidOCR
 from pynput import keyboard
 from PIL import ImageGrab
 
@@ -25,31 +25,21 @@ from PIL import ImageGrab
 # 全局配置
 # ============================================================
 
-VERSION = "v0.1-beta"
+VERSION = "v0.2-beta"
 
-# Tesseract 路径 (自动检测，找不到则用默认路径)
-def _find_tesseract():
-    """自动查找 tesseract.exe"""
-    import shutil
-    # 1. 环境变量 PATH
-    found = shutil.which("tesseract")
-    if found:
-        return found
-    candidates = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        r"D:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"D:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
-    return "tesseract"  # 兜底，让 pytesseract 报错提示
+# RapidOCR 引擎 (ONNX Runtime, CPU/DirectML 加速)
+# 检测是否可用 DirectML (AMD GPU 加速)
+import onnxruntime as ort
+_use_dml = "DmlExecutionProvider" in ort.get_available_providers()
+if _use_dml:
+    _ocr_engine = RapidOCR(det_use_dml=True, rec_use_dml=True, cls_use_dml=True)
+    _ocr_backend = "DirectML (AMD GPU)"
+else:
+    _ocr_engine = RapidOCR()
+    _ocr_backend = "CPU"
 
-pytesseract.pytesseract.tesseract_cmd = _find_tesseract()
-
-# OCR 语言 (中文简体 + 英文)
-OCR_LANG = "chi_sim+eng"
+# OCR 图像缩放：2560x1440 全图太慢，缩到最大1920宽再识别
+_OCR_MAX_WIDTH = 1920
 
 # 触发热键 (默认 PageDown，可自定义)
 HOTKEY = keyboard.Key.page_down
@@ -189,7 +179,7 @@ DELAYS = dict(DEFAULT_DELAYS)
 
 def load_delays_config():
     """从 config/delays.json 加载延迟配置和热键"""
-    global DELAYS, HOTKEY
+    global DELAYS, HOTKEY, MULTI_DESTINATIONS
     if os.path.exists(DELAYS_PATH):
         try:
             with open(DELAYS_PATH, "r", encoding="utf-8") as f:
@@ -204,6 +194,11 @@ def load_delays_config():
                 if hk is not None or data["hotkey"] is None:
                     HOTKEY = hk
                 print(f"[配置] 已加载热键: {_key_to_display(HOTKEY)}")
+            if "multi_destinations" in data:
+                saved = data["multi_destinations"]
+                for i in range(min(len(saved), 6)):
+                    MULTI_DESTINATIONS[i] = saved[i]  # None 或字符串
+                print(f"[配置] 已加载多选目的地: {[d or '（无）' for d in MULTI_DESTINATIONS]}")
         except Exception as e:
             print(f"[配置] 加载配置失败: {e}，使用默认值")
 
@@ -212,8 +207,11 @@ def save_delays_config():
     """保存延迟配置和热键到 config/delays.json"""
     try:
         with open(DELAYS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"delays": DELAYS, "hotkey": _hotkey_to_config(HOTKEY)},
-                      f, ensure_ascii=False, indent=4)
+            json.dump({
+                "delays": DELAYS,
+                "hotkey": _hotkey_to_config(HOTKEY),
+                "multi_destinations": MULTI_DESTINATIONS,
+            }, f, ensure_ascii=False, indent=4)
         log(f"配置已保存: {DELAYS_PATH}")
     except Exception as e:
         log(f"保存配置失败: {e}")
@@ -329,99 +327,101 @@ def save_debug_screenshot(img: np.ndarray, name: str):
     return path
 
 
-def _preprocess_for_ocr(img: np.ndarray):
-    """OCR 预处理：灰度 → 放大3倍 → 反转（游戏深色背景白字）"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 放大 3 倍，Tesseract 对小字体中文需要放大才准
-    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    # 反转：游戏深色背景 → 白底黑字，符合 Tesseract 期望
-    inverted = cv2.bitwise_not(gray)
-    return inverted
+def _rapid_ocr(img: np.ndarray) -> list:
+    """运行 RapidOCR，返回格式化结果列表 [{text, left, top, width, height, conf}]
+    自动缩放大图以提升识别速度，坐标已映射回原图尺寸。"""
+    h_img, w_img = img.shape[:2]
+    scale = 1.0
+    ocr_img = img
+    if w_img > _OCR_MAX_WIDTH:
+        scale = _OCR_MAX_WIDTH / w_img
+        ocr_img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    result, _ = _ocr_engine(ocr_img)
+    items = []
+    if result:
+        for box, text, conf in result:
+            text = text.strip()
+            if not text:
+                continue
+            # box 是4个角点 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            left = int(min(xs) / scale)
+            top = int(min(ys) / scale)
+            right = int(max(xs) / scale)
+            bottom = int(max(ys) / scale)
+            items.append({
+                "text": text,
+                "left": left,
+                "top": top,
+                "width": right - left,
+                "height": bottom - top,
+                "conf": float(conf),
+            })
+    return items
+
+
+def _rapid_ocr_text(img: np.ndarray) -> str:
+    """运行 RapidOCR，返回拼接的文字"""
+    items = _rapid_ocr(img)
+    return " ".join(item["text"] for item in items)
+
+
+def _group_items_by_row(items: list, threshold: int = 30) -> list:
+    """将 OCR 结果按垂直位置分组为行"""
+    if not items:
+        return []
+    sorted_items = sorted(items, key=lambda x: x["top"])
+    rows = [[sorted_items[0]]]
+    for item in sorted_items[1:]:
+        if abs(item["top"] - rows[-1][-1]["top"]) < threshold:
+            rows[-1].append(item)
+        else:
+            rows.append([item])
+    return rows
 
 
 def find_text_position(img: np.ndarray, target_text: str):
-    """
-    在图像中查找目标文字的位置
-    返回: (x, y, w, h) 屏幕坐标，如果未找到返回 None
-    """
-    scale = 3  # 与 _preprocess_for_ocr 中的放大倍数一致
-    processed = _preprocess_for_ocr(img)
-    # --psm 11: 稀疏文本模式，最适合游戏 UI 中散布的文字
-    data = pytesseract.image_to_data(processed, lang=OCR_LANG, output_type=pytesseract.Output.DICT, config="--psm 11")
+    """在图像中查找目标文字位置，返回 (x, y, w, h) 或 None。
+    使用 RapidOCR 直接识别原图，无需预处理。"""
+    items = _rapid_ocr(img)
+    log(f"RapidOCR 共识别 {len(items)} 条文字")
 
-    # 收集所有有效词
-    all_words = []
-    n = len(data["text"])
-    for i in range(n):
-        text = data["text"][i].strip()
-        conf = int(data["conf"][i])
-        if conf < 20 or not text:
-            continue
-        all_words.append({
-            "text": text,
-            "left": data["left"][i],
-            "top": data["top"][i],
-            "width": data["width"][i],
-            "height": data["height"][i],
-            "conf": conf,
-        })
-        # 单词精确匹配
-        if target_text in text:
-            x, y, w, h = data["left"][i] // scale, data["top"][i] // scale, data["width"][i] // scale, data["height"][i] // scale
-            log(f"找到文字 '{text}' (置信度: {conf}) 位置: ({x}, {y}, {w}, {h})")
+    # --- Pass 1: 精确子串匹配 ---
+    for item in items:
+        if target_text in item["text"]:
+            log(f"精确匹配 '{target_text}' in '{item["text"]}' → ({item['left']},{item['top']},{item['width']},{item['height']})")
+            return (item["left"], item["top"], item["width"], item["height"])
+
+    # --- Pass 2: 行拼接匹配 ---
+    rows = _group_items_by_row(items)
+    for row_items in rows:
+        row_items.sort(key=lambda x: x["left"])
+        combined = "".join(i["text"] for i in row_items)
+        if target_text in combined:
+            x = row_items[0]["left"]
+            y = min(i["top"] for i in row_items)
+            w = max(i["left"] + i["width"] for i in row_items) - x
+            h = max(i["top"] + i["height"] for i in row_items) - y
+            log(f"行拼接匹配 '{target_text}' in '{combined}' → ({x},{y},{w},{h})")
             return (x, y, w, h)
 
-    # 第二步：同行内按左右位置排序后拼接相邻词（中文 OCR 经常拆词且顺序错乱）
-    # 先按 top 分行（top 差值 < 20 视为同行），同行内按 left 排序
-    ROW_THRESHOLD = 20
-    all_words.sort(key=lambda w: (w["top"], w["left"]))
-    rows = []
-    for w in all_words:
-        if not rows or abs(w["top"] - rows[-1][0]["top"]) > ROW_THRESHOLD:
-            rows.append([w])
-        else:
-            rows[-1].append(w)
-    for row in rows:
-        row.sort(key=lambda w: w["left"])
-
-    # 在每行内拼接相邻词
-    for row in rows:
-        for start in range(len(row)):
-            combined = ""
-            for end in range(start, min(start + 12, len(row))):
-                combined += row[end]["text"]
-                if target_text in combined:
-                    # 找目标文字第一个字符出现在哪个词中
-                    actual_start = start
-                    char_pos = 0
-                    for k in range(start, end + 1):
-                        next_pos = char_pos + len(row[k]["text"])
-                        if next_pos > combined.index(target_text):
-                            actual_start = k
-                            break
-                        char_pos = next_pos
-                    words_range = row[actual_start:end + 1]
-                    x = words_range[0]["left"] // scale
-                    y = min(w["top"] for w in words_range) // scale
-                    x2 = max(w["left"] + w["width"] for w in words_range) // scale
-                    y2 = max(w["top"] + w["height"] for w in words_range) // scale
-                    log(f"找到拼接文字 '{combined}' 位置: ({x}, {y}, {x2 - x}, {y2 - y})")
-                    return (x, y, x2 - x, y2 - y)
-
+    log(f"未找到文字: '{target_text}'")
     return None
 
 
-def _fuzzy_match_chinese(target: str, text: str, min_ratio: float = 0.6) -> bool:
+def _fuzzy_match_chinese(target: str, text: str, min_ratio: float = 0.75) -> bool:
     """模糊匹配中文：
     1. 精确子串匹配
-    2. 目标前缀匹配（取目标前60%的字看是否出现在文本中）
-    3. 字符重叠率匹配（共同字符数/目标字符数 >= min_ratio）
+    2. 目标前缀匹配（取目标前3个字看是否出现在文本中）
+    3. 字符重叠率匹配（共同字符数/目标字符数 >= min_ratio，默认0.75）
     """
     # 精确子串
     if target in text:
         return True
-    # 前缀匹配：取前 max(2, 60%) 个字，要求出现在文本开头（防止 "ie世界树地下" 误匹配）
-    prefix_len = max(2, int(len(target) * 0.6))
+    # 前缀匹配：取前 max(3, 60%) 个字，要求出现在文本开头
+    prefix_len = max(3, int(len(target) * 0.6))
     prefix = target[:prefix_len]
     if text.startswith(prefix):
         return True
@@ -436,140 +436,35 @@ def _fuzzy_match_chinese(target: str, text: str, min_ratio: float = 0.6) -> bool
 
 def find_text_fuzzy_position(img: np.ndarray, target_text: str):
     """模糊查找文字位置（容忍OCR错字）。返回 (x, y, w, h) 或 None"""
-    scale = 3
-    processed = _preprocess_for_ocr(img)
-    data = pytesseract.image_to_data(processed, lang=OCR_LANG,
-                                     output_type=pytesseract.Output.DICT, config="--psm 11")
+    items = _rapid_ocr(img)
+    if not items:
+        log("RapidOCR 未识别到任何文字")
+        return None
 
-    all_words = []
-    n = len(data["text"])
-    for i in range(n):
-        text = data["text"][i].strip()
-        conf = int(data["conf"][i])
-        if conf < 10 or not text:
-            continue
-        all_words.append({
-            "text": text,
-            "left": data["left"][i],
-            "top": data["top"][i],
-            "width": data["width"][i],
-            "height": data["height"][i],
-            "conf": conf,
-        })
-        if _fuzzy_match_chinese(target_text, text):
-            x, y, w, h = data["left"][i] // scale, data["top"][i] // scale, data["width"][i] // scale, data["height"][i] // scale
-            log(f"模糊匹配找到 '{text}' (conf:{conf}) 位置: ({x},{y},{w},{h})")
+    # --- 精确子串匹配 ---
+    for item in items:
+        if target_text in item["text"]:
+            log(f"模糊-精确匹配 '{target_text}' in '{item['text']}' conf={item['conf']:.2f}")
+            return (item["left"], item["top"], item["width"], item["height"])
+
+    # --- 单条模糊匹配 ---
+    for item in items:
+        if _fuzzy_match_chinese(target_text, item["text"]):
+            log(f"模糊匹配找到 '{item['text']}' conf={item['conf']:.2f}")
+            return (item["left"], item["top"], item["width"], item["height"])
+
+    # --- 行拼接后模糊匹配 ---
+    rows = _group_items_by_row(items)
+    for row_items in rows:
+        row_items.sort(key=lambda x: x["left"])
+        combined = "".join(i["text"] for i in row_items)
+        if _fuzzy_match_chinese(target_text, combined):
+            x = row_items[0]["left"]
+            y = min(i["top"] for i in row_items)
+            w = max(i["left"] + i["width"] for i in row_items) - x
+            h = max(i["top"] + i["height"] for i in row_items) - y
+            log(f"模糊行拼接匹配 '{combined}' → ({x},{y},{w},{h})")
             return (x, y, w, h)
-
-    # 同行拼接后模糊匹配
-    ROW_THRESHOLD = 20
-    all_words.sort(key=lambda w: (w["top"], w["left"]))
-    rows = []
-    for w in all_words:
-        if not rows or abs(w["top"] - rows[-1][0]["top"]) > ROW_THRESHOLD:
-            rows.append([w])
-        else:
-            rows[-1].append(w)
-    for row in rows:
-        row.sort(key=lambda w: w["left"])
-    for row in rows:
-        for start in range(len(row)):
-            combined = ""
-            for end in range(start, min(start + 12, len(row))):
-                combined += row[end]["text"]
-                if _fuzzy_match_chinese(target_text, combined):
-                    # 找到目标文字在拼接串中的实际起止字符位置
-                    sub_start = combined.find(target_text)
-                    if sub_start < 0:
-                        # 模糊匹配：找目标第一个字在拼接串中的位置
-                        for ci, ch in enumerate(combined):
-                            if ch in set(target_text):
-                                sub_start = ci
-                                break
-                        else:
-                            sub_start = 0
-                    sub_end = combined.find(target_text)
-                    sub_end = sub_start + len(target_text) if sub_end >= 0 else len(combined)
-                    # 把字符位置映射回 word 索引
-                    w_start, w_end = start, end
-                    char_pos = 0
-                    for k in range(start, end + 1):
-                        w_len = len(row[k]["text"])
-                        if w_start == start and char_pos + w_len > sub_start:
-                            w_start = k
-                        if char_pos + w_len >= sub_end:
-                            w_end = k
-                            break
-                        char_pos += w_len
-                    words_range = row[w_start:w_end + 1]
-                    x = words_range[0]["left"] // scale
-                    y = min(w["top"] for w in words_range) // scale
-                    x2 = max(w["left"] + w["width"] for w in words_range) // scale
-                    y2 = max(w["top"] + w["height"] for w in words_range) // scale
-                    log(f"模糊拼接匹配 '{combined}' → 词[{w_start}:{w_end}] 位置: ({x},{y},{x2 - x},{y2 - y})")
-                    return (x, y, x2 - x, y2 - y)
-
-    # ---- 回退：裁剪目的地列表区域 + 4x 放大 + psm 6 ----
-    # 诊断证明樱花岛需要4x才能读到，3x的psm6/psm11都不行，所以跳过3x回退直接走4x
-    h_orig, w_orig = img.shape[:2]
-    # 目的地名字列在屏幕 x=22%-35%, y=25%-78% 范围内（根据截图坐标校准）
-    crop_y1, crop_y2 = int(h_orig * 0.25), int(h_orig * 0.78)
-    crop_x1, crop_x2 = int(w_orig * 0.22), int(w_orig * 0.35)
-    cropped = img[crop_y1:crop_y2, crop_x1:crop_x2]
-    gray4 = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-    gray4 = cv2.resize(gray4, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-    inv4 = cv2.bitwise_not(gray4)
-    data4 = pytesseract.image_to_data(inv4, lang=OCR_LANG,
-                                       output_type=pytesseract.Output.DICT, config="--psm 6")
-    words4 = []
-    for i in range(len(data4["text"])):
-        t = data4["text"][i].strip()
-        c = int(data4["conf"][i])
-        if c >= 5 and t:
-            words4.append({"text": t, "left": data4["left"][i], "top": data4["top"][i],
-                           "width": data4["width"][i], "height": data4["height"][i]})
-    if words4:
-        words4.sort(key=lambda w: (w["top"], w["left"]))
-        rows4 = []
-        for w in words4:
-            if not rows4 or abs(w["top"] - rows4[-1][0]["top"]) > 80:
-                rows4.append([w])
-            else:
-                rows4[-1].append(w)
-        for row in rows4:
-            row.sort(key=lambda w: w["left"])
-            for start in range(len(row)):
-                combined = ""
-                for end in range(start, min(start + 12, len(row))):
-                    combined += row[end]["text"]
-                    if _fuzzy_match_chinese(target_text, combined):
-                        sub_start = combined.find(target_text)
-                        if sub_start < 0:
-                            for ci, ch in enumerate(combined):
-                                if ch in set(target_text):
-                                    sub_start = ci
-                                    break
-                            else:
-                                sub_start = 0
-                        sub_end = combined.find(target_text)
-                        sub_end = sub_start + len(target_text) if sub_end >= 0 else len(combined)
-                        w_start, w_end = start, end
-                        char_pos = 0
-                        for k in range(start, end + 1):
-                            w_len = len(row[k]["text"])
-                            if w_start == start and char_pos + w_len > sub_start:
-                                w_start = k
-                            if char_pos + w_len >= sub_end:
-                                w_end = k
-                                break
-                            char_pos += w_len
-                        words_range = row[w_start:w_end + 1]
-                        x = words_range[0]["left"] // 4 + crop_x1
-                        y = min(w["top"] for w in words_range) // 4 + crop_y1
-                        x2 = max(w["left"] + w["width"] for w in words_range) // 4 + crop_x1
-                        y2 = max(w["top"] + w["height"] for w in words_range) // 4 + crop_y1
-                        log(f"回退(psm6/4x/crop) 匹配 '{combined}' 位置: ({x},{y},{x2 - x},{y2 - y})")
-                        return (x, y, x2 - x, y2 - y)
 
     return None
 
@@ -601,24 +496,53 @@ def find_text_fuzzy_in_screenshot(target_text: str, save_name: str = "debug"):
     return find_text_fuzzy_center(img, target_text)
 
 
+def _find_by_landmark(img: np.ndarray, target_text: str):
+    """地标定位法：当 OCR 无法识别目标文字时，
+    通过检测相邻的可识别目的地来推算目标的点击位置。
+    支持多层地标回退。返回 (cx, cy) 或 None。
+    """
+    if target_text not in DESTINATION_LANDMARKS:
+        return None
+    h_img, w_img = img.shape[:2]
+    landmarks = DESTINATION_LANDMARKS[target_text]
+    for landmark_name, offset in landmarks:
+        pos = find_text_fuzzy_position(img, landmark_name)
+        if not pos:
+            continue
+        x, y, w, h = pos
+        # 过滤掉工具窗口中的误检：游戏列表区域的文字高度至少 20px
+        # 且位置应在游戏画面中心偏左区域（x < 屏幕50%）
+        if h < 20 or x > w_img * 0.5:
+            log(f"地标法: '{landmark_name}' 位置({x},{y},{w},{h}) 不在游戏列表区域，跳过")
+            continue
+        # 列表项高度估算：地标文字高度 * 3.5（经验值），最少 100px
+        item_height = max(int(h * 3.5), 100)
+        target_cx = x + w // 2
+        target_cy = y + h // 2 + offset * item_height
+        # 确保不超出屏幕
+        target_cy = max(50, min(target_cy, h_img - 50))
+        log(f"地标法: '{landmark_name}' 在({x},{y},{w},{h}), "
+            f"推算 '{target_text}' 在({target_cx},{target_cy}), 偏移{offset}项")
+        return (target_cx, target_cy)
+    return None
+
+
 def contains_text(img: np.ndarray, target_text: str) -> bool:
     """检测图像中是否包含指定文字"""
-    processed = _preprocess_for_ocr(img)
-    text = pytesseract.image_to_string(processed, lang=OCR_LANG, config="--psm 11")
+    text = _rapid_ocr_text(img)
     found = target_text in text
-    log(f"OCR 匹配{'✓' if found else '✗'}: '{target_text}'")
+    log(f"RapidOCR 匹配{'OK' if found else 'FAIL'}: '{target_text}'")
     return found
 
 
 def contains_any_text(img: np.ndarray, keywords: list) -> bool:
     """检测图像中是否包含任意一个关键词"""
-    processed = _preprocess_for_ocr(img)
-    text = pytesseract.image_to_string(processed, lang=OCR_LANG, config="--psm 11")
+    text = _rapid_ocr_text(img)
     for kw in keywords:
         if kw in text:
-            log(f"OCR 匹配✓: '{kw}' (从候选: {keywords})")
+            log(f"RapidOCR 匹配OK: '{kw}' (从候选: {keywords})")
             return True
-    log(f"OCR 全部未匹配: {keywords}")
+    log(f"RapidOCR 全部未匹配: {keywords}")
     return False
 
 
@@ -647,7 +571,7 @@ def find_any_text_in_screenshot(keywords: list, save_name: str = "debug"):
 
 def find_blue_button_text(img: np.ndarray, target_keywords: list):
     """通过蓝色区域检测 + 局部 OCR 查找按钮文字。
-    适用于 Tesseract 全图 OCR 无法识别的蓝色按钮上的文字。
+    适用于 OCR 无法识别的蓝色按钮上的文字。
     返回中心坐标 (x, y) 或 None。
     """
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -673,28 +597,30 @@ def find_blue_button_text(img: np.ndarray, target_keywords: list):
             candidates.append((x, y, bw, bh, area))
     candidates.sort(key=lambda t: t[4], reverse=True)
 
-    # 两遍匹配：第一遍找精确匹配（文字长度接近关键词），第二宽松匹配
+    # 只处理前 10 个最大的候选区域，避免小噪点拖慢速度
+    candidates = candidates[:10]
+    log(f"蓝色区域检测: 找到 {len(candidates)} 个候选按钮")
+
+    # 用 RapidOCR 识别每个候选区域
     fallback = None
-    for x, y, bw, bh, area in candidates:
+    for idx, (x, y, bw, bh, area) in enumerate(candidates):
         roi = img[y:y + bh, x:x + bw]
-        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        roi_big = cv2.resize(roi_gray, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        roi_inv = cv2.bitwise_not(roi_big)
-        for proc, label in [(roi_inv, "反转"), (roi_big, "正常")]:
-            for psm in ["--psm 7", "--psm 6"]:
-                text = pytesseract.image_to_string(proc, lang=OCR_LANG, config=psm).strip()
-                for kw in target_keywords:
-                    if kw in text:
-                        cx, cy = x + bw // 2, y + bh // 2
-                        # 精确匹配：OCR文字长度 <= 关键词长度 + 2
-                        if len(text) <= len(kw) + 2:
-                            log(f"蓝色按钮OCR({label},{psm}) 精确✓: '{kw}' in '{text}' at ({cx},{cy})")
-                            return (cx, cy)
-                        if fallback is None:
-                            fallback = (cx, cy, kw, text)
+        items = _rapid_ocr(roi)
+        text = " ".join(item["text"] for item in items)
+        if text:
+            log(f"  [{idx+1}/{len(candidates)}] ({x},{y}) {bw}x{bh} → '{text}'")
+        for kw in target_keywords:
+            if kw in text:
+                cx, cy = x + bw // 2, y + bh // 2
+                if len(text) <= len(kw) + 2:
+                    log(f"蓝色按钮RapidOCR 精确OK: '{kw}' in '{text}' at ({cx},{cy})")
+                    return (cx, cy)
+                if fallback is None:
+                    fallback = (cx, cy, kw, text)
+                break
     if fallback:
         cx, cy, kw, text = fallback
-        log(f"蓝色按钮OCR 宽松✓: '{kw}' in '{text}' at ({cx},{cy})")
+        log(f"蓝色按钮RapidOCR 宽松OK: '{kw}' in '{text}' at ({cx},{cy})")
         return (cx, cy)
     log(f"蓝色区域检测: {len(candidates)} 个候选，均未匹配 {target_keywords}")
     return None
@@ -711,12 +637,65 @@ def find_blue_button_in_screenshot(keywords: list, save_name: str = "debug"):
 # 鼠标操作
 # ============================================================
 
-def click_position(x: int, y: int, duration: float = 0.2):
-    """移动鼠标到指定位置并点击"""
-    log(f"移动鼠标到 ({x}, {y}) 并点击")
-    pyautogui.moveTo(x, y, duration=duration)
+def _send_mouse_click(x: int, y: int):
+    """通过 SendInput 移动鼠标并点击（兼容 DirectInput 游戏）
+    坐标为屏幕绝对坐标。SendInput 的绝对坐标范围是 0-65535。
+    """
+    extra = ctypes.c_ulong(0)
+    cx_screen = ctypes.windll.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    cy_screen = ctypes.windll.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    # 归一化到 0-65535
+    nx = int(x * 65535 / cx_screen)
+    ny = int(y * 65535 / cy_screen)
+
+    def _mouse_event(flags, data=0):
+        inp = INPUT()
+        inp.type = INPUT_MOUSE
+        inp.input.mi.dx = nx
+        inp.input.mi.dy = ny
+        inp.input.mi.mouseData = data
+        inp.input.mi.dwFlags = flags
+        inp.input.mi.time = 0
+        inp.input.mi.dwExtraInfo = ctypes.pointer(extra)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+    # 移动 + 左键按下 + 左键抬起
+    _mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
+    time.sleep(0.03)
+    _mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN)
     time.sleep(0.05)
-    pyautogui.click(x, y)
+    _mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP)
+
+
+def _send_mouse_move(x: int, y: int):
+    """通过 SendInput 仅移动鼠标（不点击），兼容 DirectInput 游戏"""
+    extra = ctypes.c_ulong(0)
+    cx_screen = ctypes.windll.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    cy_screen = ctypes.windll.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    nx = int(x * 65535 / cx_screen)
+    ny = int(y * 65535 / cy_screen)
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.input.mi.dx = nx
+    inp.input.mi.dy = ny
+    inp.input.mi.mouseData = 0
+    inp.input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+    inp.input.mi.time = 0
+    inp.input.mi.dwExtraInfo = ctypes.pointer(extra)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
+def click_position(x: int, y: int, duration: float = 0.2):
+    """移动鼠标到指定位置并点击（使用 SendInput 底层 API，兼容 DirectInput 游戏）"""
+    log(f"移动鼠标到 ({x}, {y}) 并点击")
+    # 先用 pyautogui 平滑移动（让玩家能看到光标）
+    try:
+        pyautogui.moveTo(x, y, duration=duration)
+    except Exception:
+        pass
+    time.sleep(0.05)
+    # 用 SendInput 底层 API 点击（兼容 DirectInput 游戏）
+    _send_mouse_click(x, y)
 
 
 # ============================================================
@@ -729,7 +708,15 @@ KEYEVENTF_KEYUP = 0x0002
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 MOUSEEVENTF_WHEEL = 0x0800
-WHEEL_DELTA = 120  # 每个滚轮刻度 = 120
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+WHEEL_DELTA = 900  # 每个滚轮刻度
+
+# 虚拟屏幕尺寸 (用于 SendInput 绝对坐标归一化)
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -788,6 +775,12 @@ def scroll_down(pages: int = 1):
     # 每页滚动 5 个刻度 = 5 * 120 = 600, 负数=向下
     scroll_val = -WHEEL_DELTA * 5 * pages
     log(f"滚轮向下翻 {pages} 页 (scroll={scroll_val})")
+    _send_mouse_wheel(scroll_val)
+
+
+def scroll_notches(count: int):
+    """按指定刻度数滚动（正=向下，负=向上）"""
+    scroll_val = -WHEEL_DELTA * count
     _send_mouse_wheel(scroll_val)
 
 
@@ -903,6 +896,18 @@ DESTINATIONS_PAGE2 = [
 ]
 
 
+# 地标映射：OCR 无法识别的目的地 → 用相邻可识别目的地定位
+# target: [(landmark_name, y_offset_in_items), ...]  负数=上方，按优先级排列
+DESTINATION_LANDMARKS = {
+    "天坠魔窟": [("天阳乡浮岛", -1), ("世界树地下都市遗址", -2)],
+}
+
+# 多选目的地配置（6个槽位，None 表示"无"）
+MULTI_DESTINATIONS = [None] * 6
+
+# 所有可选目的地（含"无"）
+ALL_DESTINATIONS_WITH_NONE = ["（无）"] + DESTINATIONS_PAGE1 + DESTINATIONS_PAGE2
+
 # ============================================================
 # 核心自动化逻辑
 # ============================================================
@@ -912,10 +917,28 @@ class AutoExpedition:
         self.running = False
         self._lock = threading.Lock()
         self.destination = "草原的洞穴"  # 默认目的地
+        self.multi_mode = False          # 是否多选模式
+        self.multi_destinations = []     # 多选目的地列表
         self.original_time = None
+        self._real_time = None           # 真实时间（用于最后恢复）
+
+    def _restore_real_time(self):
+        """恢复到当前真实时间（补偿期间经过的时间）"""
+        if self._real_time:
+            elapsed = time.monotonic() - self._step8_mono
+            real_now = adjust_time(self._real_time, elapsed)
+            if set_system_time(real_now):
+                log(f"已恢复真实时间: {format_time(real_now)} (经过 {elapsed:.1f}s)")
+            else:
+                log("恢复真实时间失败！请手动调整")
+            self._real_time = None
 
     def set_destination(self, dest: str):
         self.destination = dest
+
+    def set_multi_destinations(self, dests: list):
+        """设置多选目的地列表（已过滤掉 None）"""
+        self.multi_destinations = [d for d in dests if d]
 
     def start(self):
         """启动自动化流程"""
@@ -924,7 +947,10 @@ class AutoExpedition:
             return
         self.running = True
         log("=" * 50)
-        log(f"启动自动化流程，目的地: {self.destination}")
+        if self.multi_mode and self.multi_destinations:
+            log(f"启动自动化流程（多选模式），目的地队列: {' → '.join(self.multi_destinations)}")
+        else:
+            log(f"启动自动化流程，目的地: {self.destination}")
         log("=" * 50)
         threading.Thread(target=self._run_loop, daemon=True).start()
 
@@ -936,15 +962,41 @@ class AutoExpedition:
     def _run_loop(self):
         """主循环：重复执行远征流程"""
         try:
-            while self.running:
-                success = self._run_once()
-                if not self.running:
-                    break
-                if not success:
-                    log("本次流程失败，停止运行")
-                    break
-                log("本次流程完成，准备下一轮...")
-                time.sleep(0.5)
+            # 多选模式：按队列顺序循环执行
+            if self.multi_mode and self.multi_destinations:
+                round_num = 0
+                while self.running:
+                    round_num += 1
+                    log(f"[多选] ====== 第 {round_num} 轮 ======")
+                    for i, dest in enumerate(self.multi_destinations):
+                        if not self.running:
+                            break
+                        self.destination = dest
+                        log(f"[多选] 第 {i+1}/{len(self.multi_destinations)} 个目的地: {dest}")
+                        success = self._run_once()
+                        if not self.running:
+                            break
+                        if not success:
+                            log(f"[多选] 目的地 '{dest}' 失败，停止运行")
+                            self.running = False
+                            break
+                        if i < len(self.multi_destinations) - 1:
+                            log(f"[多选] '{dest}' 完成，准备下一个...")
+                            time.sleep(0.5)
+                    if self.running:
+                        log(f"[多选] 第 {round_num} 轮全部完成，开始下一轮...")
+                        time.sleep(0.5)
+            else:
+                # 单选模式：循环执行同一目的地
+                while self.running:
+                    success = self._run_once()
+                    if not self.running:
+                        break
+                    if not success:
+                        log("本次流程失败，停止运行")
+                        break
+                    log("本次流程完成，准备下一轮...")
+                    time.sleep(0.5)
         finally:
             self.running = False
             self._lock.release()
@@ -953,11 +1005,13 @@ class AutoExpedition:
     def _run_once(self) -> bool:
         """执行一次完整的远征流程，返回是否成功"""
         self.original_time = None
+        self._real_time = None
+        self._step8_mono = 0
         self._rollback_mono = 0
         try:
             return self._run_once_inner()
         finally:
-            # 无论成功还是失败，都确保恢复系统时间（补偿经过的时间）
+            # 无论成功还是失败，都确保恢复到真实时间
             if self.original_time:
                 elapsed = time.monotonic() - self._rollback_mono
                 restored = adjust_time(self.original_time, elapsed)
@@ -966,6 +1020,8 @@ class AutoExpedition:
                 else:
                     log("[安全恢复] 恢复时间失败！请手动调整")
                 self.original_time = None
+            if self._real_time:
+                self._restore_real_time()
 
     def _run_once_inner(self) -> bool:
         """执行一次完整的远征流程（内部实现），返回是否成功"""
@@ -989,13 +1045,26 @@ class AutoExpedition:
         save_debug_screenshot(img, "step4")
 
         if not contains_any_text(img, EXPEDITION_KEYWORDS):
-            log(f"第一次未检测到远征界面，等待 {DELAYS['detection_retry']*2}s 后重试...")
-            time.sleep(DELAYS["detection_retry"] * 2)
-            img2 = take_screenshot()
-            save_debug_screenshot(img2, "step4_retry")
-            if not contains_any_text(img2, EXPEDITION_KEYWORDS):
-                log("第二次仍未检测到远征界面，停止运行")
-                return False
+            # 可能是F键没有正确输入，检查是否有"打开"提示
+            OPEN_KEYWORDS = ["打开", "交互", "调查"]
+            if contains_any_text(img, OPEN_KEYWORDS):
+                log("检测到'打开'提示，F键可能未生效，重新按下F...")
+                time.sleep(0.3)
+                send_key("f")
+                time.sleep(DELAYS["detection_retry"] * 2)
+                img = take_screenshot()
+                save_debug_screenshot(img, "step4_repF")
+                if not contains_any_text(img, EXPEDITION_KEYWORDS):
+                    log("重新按F后仍未检测到远征界面，停止运行")
+                    return False
+            else:
+                log(f"第一次未检测到远征界面，等待 {DELAYS['detection_retry']*2}s 后重试...")
+                time.sleep(DELAYS["detection_retry"] * 2)
+                img2 = take_screenshot()
+                save_debug_screenshot(img2, "step4_retry")
+                if not contains_any_text(img2, EXPEDITION_KEYWORDS):
+                    log("第二次仍未检测到远征界面，停止运行")
+                    return False
 
         # ---- 步骤 5：检测派遣界面 ----
         DISPATCH_KEYWORDS = ["请选择派遣帕鲁远征的目的地", "派遣帕鲁远征", "选择目的", "目的地"]
@@ -1016,7 +1085,7 @@ class AutoExpedition:
         time.sleep(DELAYS["pre_action"])
 
         # 优先用蓝色区域检测（只用'自动指派'精确匹配，避免匹配到'指派时的例外设置'）
-        AUTO_KEYWORDS = ["自动指派"]
+        AUTO_KEYWORDS = ["自动指派", "自动指泊", "自动指"]
         pos = find_blue_button_in_screenshot(AUTO_KEYWORDS, "step7")
         if pos:
             click_position(pos[0], pos[1])
@@ -1047,6 +1116,8 @@ class AutoExpedition:
         # ---- 步骤 8：回拨系统时间 1 小时 ----
         log(f"[步骤8] 等待 {DELAYS['pre_action']}s 后回拨系统时间 1 小时")
         time.sleep(DELAYS["pre_action"])
+        self._real_time = get_system_time()  # 保存真实时间
+        self._step8_mono = time.monotonic()  # 记录单调时钟
         self.original_time = rollback_time_one_hour()
         if self.original_time is None:
             log("时间回拨失败，停止运行")
@@ -1084,21 +1155,65 @@ class AutoExpedition:
                 return False
         click_position(pos[0], pos[1])
 
-        # ---- 步骤 9.5：恢复系统时间（补偿经过的时间，精确到毫秒） ----
-        log(f"[步骤9.5] 等待 {DELAYS['time_restore_wait']}s 后恢复系统时间")
-        time.sleep(DELAYS["time_restore_wait"])
-        if self.original_time:
-            elapsed = time.monotonic() - self._rollback_mono
-            restored = adjust_time(self.original_time, elapsed)
-            if set_system_time(restored):
-                log(f"已恢复至: {format_time(restored)} (补偿 {elapsed:.3f}s)")
-            else:
-                log("恢复时间失败！请手动调整")
-            self.original_time = None
+        # ---- 步骤 9.5：恢复系统时间 → 远征才会结束 ----
+        # Palworld 远征机制：回拨时间后点开始，恢复时间时游戏发现时间已到 → 远征完成
+        # 如果恢复后仍显示"远征中"，说明回拨不够，再回拨1小时再恢复
+        log("[步骤9.5] 等待游戏记录开始时间...")
+        time.sleep(1.0)
 
-        # ---- 步骤 10-12：按F → 检测物品栏 → 没找到则重试按F ----
+        expedition_done = False
+        max_attempts = 5  # 最多往后推5次（5小时，足够任何远征）
+
+        for attempt in range(1, max_attempts + 1):
+            # 恢复/推进系统时间
+            if attempt == 1:
+                # 第一次：恢复到真实时间
+                if self.original_time:
+                    elapsed = time.monotonic() - self._rollback_mono
+                    restored = adjust_time(self.original_time, elapsed)
+                    if set_system_time(restored):
+                        log(f"[尝试{attempt}] 恢复时间至: {format_time(restored)}")
+                    else:
+                        log("恢复时间失败！请手动调整")
+                    self.original_time = None
+            else:
+                # 后续：往后推1小时
+                current = get_system_time()
+                pushed = adjust_time(current, 3600)  # +1小时
+                if set_system_time(pushed):
+                    log(f"[尝试{attempt}] 时间往后推1小时至: {format_time(pushed)}")
+                else:
+                    log("推进时间失败！")
+
+            # 等待游戏响应
+            time.sleep(2.0)
+
+            # 检测结果
+            img = take_screenshot()
+            save_debug_screenshot(img, f"step9_5_attempt{attempt}")
+
+            # 情况1: 远征完成 → 恢复真实时间，进入步骤10
+            if contains_any_text(img, ["物品栏", "领取", "奖励", "完成"]):
+                log(f"远征完成！（第{attempt}次尝试后）")
+                # 恢复到真实时间
+                self._restore_real_time()
+                expedition_done = True
+                break
+
+            # 情况2: 仍在远征中 → 下次循环再往后推1小时
+            if contains_any_text(img, ["远征中", "剩余时间", "远征"]):
+                log(f"仍在远征中，下次往后推1小时...")
+            else:
+                log(f"未检测到明确状态，等待后重试...")
+
+        if not expedition_done:
+            # 恢复真实时间
+            self._restore_real_time()
+            log("多次尝试后仍未确认远征完成，继续尝试领取...")
+
+        # ---- 步骤 10-12：按F → 检测物品栏 → 没找到再按一次F，两次都没有直接按X ----
         menu_opened = False
-        for f_attempt in range(3):
+        for f_attempt in range(2):
             wait_t = 0.5 if f_attempt == 0 else DELAYS["detection_retry"]
             log(f"[步骤10] 等待 {wait_t:.1f}s 后按下 F 键 (第{f_attempt + 1}次)")
             time.sleep(wait_t)
@@ -1113,7 +1228,7 @@ class AutoExpedition:
             log(f"第{f_attempt + 1}次F后未检测到 '物品栏'，重试...")
 
         if not menu_opened:
-            log("3次按F后仍未检测到物品栏，跳过取奖励")
+            log("2次按F后仍未检测到物品栏，直接按X取奖励")
 
         # 按 X 取走全部奖励
         log("按下 X 取走全部奖励")
@@ -1125,47 +1240,98 @@ class AutoExpedition:
         press_key("escape")
         time.sleep(DELAYS["step12_close_wait"])
 
-        log("本次远征流程完成 ✓")
+        log("本次远征流程完成 [OK]")
         return True
 
     def _step6_select_destination(self) -> bool:
-        """步骤6：选择目的地（使用模糊匹配容忍OCR错字）"""
+        """步骤6：选择目的地
+        第一页：直接截图识别，移动鼠标到文字位置点击
+        第二页：滚动一页→500ms→截图识别→没找到检查是否有第一页文字→
+               有则说明滚动没生效，再截图验证一次→还没有就停止
+        """
         dest = self.destination
-        needs_page2 = dest in DESTINATIONS_PAGE2
 
         screen_w, screen_h = pyautogui.size()
         list_x, list_y = screen_w // 2, screen_h // 2
 
-        max_scrolls = 4  # 最多滚动次数
-
-        # PAGE2 目的地先翻一整页
-        if needs_page2:
-            log(f"目的地 '{dest}' 在第二页，先向下翻页...")
-            pyautogui.moveTo(list_x, list_y, duration=DELAYS["click_move"])
+        def _move_and_scroll(notches):
+            """只移动鼠标到列表中心（不点击），然后滚动"""
+            _send_mouse_move(list_x, list_y)
             time.sleep(0.1)
-            scroll_down()
-            time.sleep(DELAYS["scroll_wait"])
+            log(f"滚动 {notches} 格")
+            scroll_notches(notches)
+            time.sleep(0.5)  # 等500ms让列表滚动到位
 
-        # 第一次尝试（不滚动）
-        pos = find_text_fuzzy_in_screenshot(dest, "step6")
+        def _try_find():
+            """截图识别目标文字，返回中心坐标或None"""
+            img = take_screenshot()
+            save_debug_screenshot(img, "step6")
+            # 先精确查找
+            pos = find_text_fuzzy_center(img, dest)
+            if pos:
+                return pos
+            # 地标法回退
+            pos = _find_by_landmark(img, dest)
+            if pos:
+                return pos
+            return None
+
+        def _check_page1_visible(img):
+            """检查截图中是否有第一页的目的地文字（说明还在第一页）"""
+            page1_names = ["草原的洞穴", "森林的秘境", "火山的灼热洞穴",
+                           "沙漠的隐秘遗迹", "雪山的冻结洞穴", "樱花岛的灵花洞穴"]
+            return contains_any_text(img, page1_names)
+
+        # ---- 第一页目的地：直接识别 ----
+        if dest not in DESTINATIONS_PAGE2:
+            log(f"目的地 '{dest}'（第一页），直接识别...")
+            pos = _try_find()
+            if pos:
+                click_position(pos[0], pos[1])
+                return True
+            # 第一页没找到，再截图验证一次
+            log("第一次未找到，重新截图验证...")
+            time.sleep(0.5)
+            pos = _try_find()
+            if pos:
+                click_position(pos[0], pos[1])
+                return True
+            log(f"未找到目的地 '{dest}'，停止运行")
+            return False
+
+        # ---- 第二页目的地：滚动一次后识别 ----
+        log(f"目的地 '{dest}'（第二页），向下滚动一页...")
+        _move_and_scroll(1)
+
+        # 第1次尝试：滚动后直接识别
+        pos = _try_find()
         if pos:
             click_position(pos[0], pos[1])
             return True
 
-        # 逐步向下滚动搜索
-        for i in range(max_scrolls):
-            log(f"未找到，向下滚动... (第{i + 1}次)")
-            pyautogui.moveTo(list_x, list_y, duration=DELAYS["click_move"])
-            time.sleep(0.1)
-            scroll_down()
-            time.sleep(DELAYS["scroll_wait"])
-            pos = find_text_fuzzy_in_screenshot(dest, f"step6_scroll{i + 1}")
+        # 没找到 → 检查有没有第一页的文字（草原的洞穴等）
+        log("未找到目标，检查是否仍在第一页...")
+        img = take_screenshot()
+        if _check_page1_visible(img):
+            # 看到了第一页文字，说明滚动没生效，再截图验证一次
+            log("检测到第一页文字，滚动可能未生效，再截图验证...")
+            time.sleep(0.5)
+            pos = _try_find()
             if pos:
                 click_position(pos[0], pos[1])
                 return True
-
-        log(f"未找到目的地 '{dest}'（滚动{max_scrolls}次后仍失败），停止运行")
-        return False
+            log(f"验证后仍未找到 '{dest}'，停止运行")
+            return False
+        else:
+            # 没看到第一页文字，可能在中间位置，再截图验证一次
+            log("未检测到第一页文字，再截图验证...")
+            time.sleep(0.5)
+            pos = _try_find()
+            if pos:
+                click_position(pos[0], pos[1])
+                return True
+            log(f"未找到目的地 '{dest}'，停止运行")
+            return False
 
 
 # ============================================================
@@ -1227,7 +1393,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f"PalFastExpeditions {VERSION}")
-        self.root.geometry("700x750")
+        self.root.geometry("800x900")
         self.root.resizable(True, True)
 
         # 设置图标和样式
@@ -1253,13 +1419,25 @@ class App:
         ttk.Label(frame_top, text="选择远征目的地:").pack(side="left")
 
         all_destinations = DESTINATIONS_PAGE1 + DESTINATIONS_PAGE2
+        combo_values = all_destinations + ["多选"]
         self.dest_var = tk.StringVar(value=all_destinations[0])
         dest_combo = ttk.Combobox(
             frame_top, textvariable=self.dest_var,
-            values=all_destinations, state="readonly", width=25
+            values=combo_values, state="readonly", width=25
         )
         dest_combo.pack(side="left", padx=10)
         dest_combo.bind("<<ComboboxSelected>>", self._on_dest_change)
+
+        # 多选设置按钮（默认隐藏）
+        self.multi_btn = ttk.Button(frame_top, text="多选设置", command=self._open_multi_settings)
+        # 初始状态：如果配置已保存了多选模式，显示按钮
+        if self.dest_var.get() == "多选":
+            self.multi_btn.pack(side="left", padx=5)
+
+        # 多选状态标签（第二行）
+        self.multi_status_label = ttk.Label(frame_top, text="", foreground="blue")
+        self.multi_status_label.pack(anchor="w", padx=(0, 0), pady=(3, 0))
+        self._update_multi_status()
 
         # ---- 中部：控制按钮 ----
         frame_mid = ttk.LabelFrame(self.root, text="控制", padding=10)
@@ -1279,15 +1457,11 @@ class App:
         self.status_label = ttk.Label(frame_mid, text="状态: 就绪", foreground="gray")
         self.status_label.pack(side="right", padx=10)
 
-        # ---- Tesseract 路径设置 ----
-        frame_tess = ttk.LabelFrame(self.root, text="Tesseract 设置", padding=10)
-        frame_tess.pack(fill="x", padx=10, pady=5)
+        # ---- RapidOCR 状态 ----
+        frame_ocr = ttk.LabelFrame(self.root, text="OCR 引擎", padding=10)
+        frame_ocr.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(frame_tess, text="Tesseract 路径:").pack(side="left")
-        self.tess_var = tk.StringVar(value=pytesseract.pytesseract.tesseract_cmd)
-        tess_entry = ttk.Entry(frame_tess, textvariable=self.tess_var, width=50)
-        tess_entry.pack(side="left", padx=5)
-        ttk.Button(frame_tess, text="应用", command=self._apply_tess_path).pack(side="left")
+        ttk.Label(frame_ocr, text=f"RapidOCR 已加载 ({_ocr_backend})", foreground="green").pack(side="left")
 
         # ---- 缓存管理 ----
         frame_cache = ttk.LabelFrame(self.root, text="缓存管理", padding=10)
@@ -1358,8 +1532,75 @@ class App:
     def _on_dest_change(self, event=None):
         """目的地变更"""
         dest = self.dest_var.get()
-        _expedition.set_destination(dest)
-        log(f"目的地已切换为: {dest}")
+        if dest == "多选":
+            self.multi_btn.pack(side="left", padx=5)
+            self._update_multi_status()
+            log("已切换到多选模式")
+        else:
+            self.multi_btn.pack_forget()
+            self.multi_status_label.config(text="")
+            _expedition.multi_mode = False
+            _expedition.set_destination(dest)
+            log(f"目的地已切换为: {dest}")
+
+    def _update_multi_status(self):
+        """更新多选状态标签"""
+        active = [d for d in MULTI_DESTINATIONS if d]
+        if active:
+            display = " → ".join(active)
+            self.multi_status_label.config(text=f"队列: {display}", foreground="blue")
+        else:
+            self.multi_status_label.config(text="队列: [未设置]", foreground="gray")
+
+    def _open_multi_settings(self):
+        """打开多选设置弹窗"""
+        win = tk.Toplevel(self.root)
+        win.title("多选目的地设置")
+        win.resizable(False, False)
+        win.grab_set()  # 模态窗口
+
+        ttk.Label(win, text='设置远征目的地执行顺序(留空或选(无)表示跳过):',
+                  font=("", 9)).pack(padx=15, pady=(15, 5))
+
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="x", padx=10)
+
+        all_values = ["（无）"] + DESTINATIONS_PAGE1 + DESTINATIONS_PAGE2
+        combos = []
+
+        for i in range(6):
+            row_frame = ttk.Frame(frame)
+            row_frame.pack(fill="x", pady=3)
+            ttk.Label(row_frame, text=f"第 {i+1} 个:", width=8).pack(side="left")
+
+            # 当前值：从 MULTI_DESTINATIONS 读取
+            current = MULTI_DESTINATIONS[i] if MULTI_DESTINATIONS[i] else "（无）"
+            var = tk.StringVar(value=current)
+            combo = ttk.Combobox(row_frame, textvariable=var,
+                                values=all_values, state="readonly", width=25)
+            combo.pack(side="left", padx=5)
+            combos.append(var)
+
+        def _apply():
+            for i in range(6):
+                val = combos[i].get()
+                MULTI_DESTINATIONS[i] = None if val == "（无）" else val
+            save_delays_config()
+            self._update_multi_status()
+            active = [d for d in MULTI_DESTINATIONS if d]
+            log(f"多选目的地已更新: {' → '.join(active) if active else '（空）'}")
+            win.destroy()
+
+        btn_frame = ttk.Frame(win, padding=10)
+        btn_frame.pack(fill="x")
+        ttk.Button(btn_frame, text="确定", command=_apply).pack(side="right", padx=5)
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side="right", padx=5)
+
+        # 居中显示
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{x}+{y}")
 
     def _toggle(self):
         """切换开始/停止"""
@@ -1370,7 +1611,19 @@ class App:
 
     def _start(self):
         """开始"""
-        _expedition.set_destination(self.dest_var.get())
+        dest = self.dest_var.get()
+        if dest == "多选":
+            # 多选模式
+            active = [d for d in MULTI_DESTINATIONS if d]
+            if not active:
+                log('多选模式下未设置任何目的地，请先点击"多选设置"配置')
+                return
+            _expedition.multi_mode = True
+            _expedition.set_multi_destinations(active)
+        else:
+            # 单选模式
+            _expedition.multi_mode = False
+            _expedition.set_destination(dest)
         _expedition.start()
         self.status_label.config(text="状态: 运行中", foreground="green")
         self.root.iconify()  # 最小化窗口
@@ -1396,16 +1649,6 @@ class App:
         self.tip_label.config(
             text=f"提示: 按 {hk_name} 开始/停止 | 确保以管理员权限运行 | 鼠标移到屏幕左上角可紧急停止"
         )
-
-    def _apply_tess_path(self):
-        """应用 Tesseract 路径"""
-        path = self.tess_var.get().strip()
-        if os.path.isfile(path):
-            pytesseract.pytesseract.tesseract_cmd = path
-            log(f"Tesseract 路径已更新: {path}")
-            messagebox.showinfo("成功", f"Tesseract 路径已更新:\n{path}")
-        else:
-            messagebox.showerror("错误", f"文件不存在:\n{path}")
 
     def _get_cache_size(self):
         """计算 screenshots 目录大小"""
@@ -1494,8 +1737,23 @@ if __name__ == "__main__":
     print()
     print(f"  配置目录: {CONFIG_DIR}")
     print()
-    print("  ⚠ 请确保以管理员权限运行！")
-    print("  ⚠ 请确保 Tesseract OCR 已安装！")
+
+    # 管理员权限检测
+    _is_admin = False
+    try:
+        _is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        pass
+    if not _is_admin:
+        print("  [!] 警告: 未以管理员权限运行!")
+        print("  [!] 游戏如果是管理员运行的, SendInput 鼠标/滚轮将无法工作")
+        print("  [!] 请右键以管理员身份运行此程序")
+        print()
+    else:
+        print("  [OK] 已以管理员权限运行")
+
+    print(f"  OCR 引擎: RapidOCR ({_ocr_backend})")
+    print(f"  RapidOCR 引擎首次加载较慢（约5-10秒），属正常现象")
     print("=" * 50)
     print()
 

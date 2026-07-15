@@ -10,7 +10,7 @@ if %errorlevel% neq 0 (
 )
 
 echo ========================================
-echo   PalFastExpeditions v0.1-beta
+echo   PalFastExpeditions v0.2-beta
 echo ========================================
 echo.
 echo [√] 已以管理员权限运行
