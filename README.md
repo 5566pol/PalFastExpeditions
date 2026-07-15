@@ -8,7 +8,7 @@
 - Windows 10/11
 - ~~Tesseract OCR~~(已弃用)
 
-## 安装 Tesseract OCR
+## ~~安装 Tesseract OCR~~
 
 1. 下载 Tesseract OCR 安装包：
 https://github.com/UB-Mannheim/tesseract/wiki
