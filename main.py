@@ -28,15 +28,88 @@ from PIL import ImageGrab
 VERSION = "v0.2-beta"
 
 # RapidOCR 引擎 (ONNX Runtime, CPU/DirectML 加速)
-# 检测是否可用 DirectML (AMD GPU 加速)
 import onnxruntime as ort
-_use_dml = "DmlExecutionProvider" in ort.get_available_providers()
-if _use_dml:
-    _ocr_engine = RapidOCR(det_use_dml=True, rec_use_dml=True, cls_use_dml=True)
-    _ocr_backend = "DirectML (AMD GPU)"
-else:
-    _ocr_engine = RapidOCR()
-    _ocr_backend = "CPU"
+_DML_AVAILABLE = "DmlExecutionProvider" in ort.get_available_providers()
+_ocr_use_gpu = _DML_AVAILABLE  # 默认：有DirectML就用GPU，否则CPU
+_ocr_engine = None
+_ocr_backend = "CPU"
+
+
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+# 日志文件精确到时分秒: logs/2026-07-23_183045.log
+_log_file_path = os.path.join(LOG_DIR, f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.log")
+_log_file = None
+
+
+def _get_log_file():
+    """懒加载日志文件句柄"""
+    global _log_file
+    if _log_file is None:
+        try:
+            _log_file = open(_log_file_path, "a", encoding="utf-8")
+        except Exception:
+            pass
+    return _log_file
+
+
+def _log_early(msg: str):
+    """模块加载时的日志（log() 尚未定义时的 fallback）"""
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    f = _get_log_file()
+    if f:
+        try:
+            f.write(line + "\n")
+            f.flush()
+        except Exception:
+            pass
+
+
+def _init_ocr_engine(use_gpu: bool = None):
+    """初始化或切换 OCR 引擎
+    use_gpu: True=GPU(DirectML), False=CPU, None=自动检测
+    返回 (engine, backend_name)
+    """
+    global _ocr_engine, _ocr_backend, _ocr_use_gpu
+    if use_gpu is None:
+        use_gpu = _DML_AVAILABLE
+    if use_gpu and not _DML_AVAILABLE:
+        _log_early("[OCR] DirectML 不可用，回退到 CPU 模式")
+        use_gpu = False
+    _ocr_use_gpu = use_gpu
+    _ocr_engine = RapidOCR(det_use_dml=use_gpu, rec_use_dml=use_gpu, cls_use_dml=use_gpu)
+    _ocr_backend = "DirectML (GPU)" if use_gpu else "CPU"
+    _log_early(f"[OCR] 引擎已初始化: {_ocr_backend}")
+    return _ocr_engine, _ocr_backend
+
+
+def _ocr_self_check():
+    """RapidOCR 自检：生成一张测试图片，验证引擎可用"""
+    try:
+        import numpy as _np
+        test_img = _np.ones((100, 300, 3), dtype=_np.uint8) * 255
+        import cv2 as _cv2
+        _cv2.putText(test_img, "TEST", (30, 70), _cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 3)
+        t0 = time.time()
+        result, _ = _ocr_engine(test_img)
+        elapsed = time.time() - t0
+        if result:
+            texts = [item[1] for item in result]
+            _log_early(f"[OCR] 自检通过 ({elapsed:.2f}s): 识别到 {texts}")
+            return True
+        else:
+            _log_early(f"[OCR] 自检警告 ({elapsed:.2f}s): 未识别到文字（引擎可能正常，测试图太简单）")
+            return True  # 引擎能运行就算通过
+    except Exception as e:
+        _log_early(f"[OCR] 自检失败: {e}")
+        return False
+
+
+# 启动时自动初始化
+_init_ocr_engine()
+_ocr_self_check()
 
 # OCR 图像缩放：2560x1440 全图太慢，缩到最大1920宽再识别
 _OCR_MAX_WIDTH = 1920
@@ -173,13 +246,16 @@ DELAY_LABELS = {
     "time_restore_wait": "恢复时间后等待",
 }
 
+# 多选目的地配置（6个槽位，None 表示"无"）
+MULTI_DESTINATIONS = [None] * 6
+
 # 当前延迟值（运行时使用）
 DELAYS = dict(DEFAULT_DELAYS)
 
 
 def load_delays_config():
-    """从 config/delays.json 加载延迟配置和热键"""
-    global DELAYS, HOTKEY, MULTI_DESTINATIONS
+    """从 config/delays.json 加载延迟配置、热键和OCR设置"""
+    global DELAYS, HOTKEY, MULTI_DESTINATIONS, _ocr_use_gpu
     if os.path.exists(DELAYS_PATH):
         try:
             with open(DELAYS_PATH, "r", encoding="utf-8") as f:
@@ -199,18 +275,22 @@ def load_delays_config():
                 for i in range(min(len(saved), 6)):
                     MULTI_DESTINATIONS[i] = saved[i]  # None 或字符串
                 print(f"[配置] 已加载多选目的地: {[d or '（无）' for d in MULTI_DESTINATIONS]}")
+            if "ocr_use_gpu" in data:
+                _ocr_use_gpu = bool(data["ocr_use_gpu"])
+                print(f"[配置] 已加载OCR模式: {'GPU' if _ocr_use_gpu else 'CPU'}")
         except Exception as e:
             print(f"[配置] 加载配置失败: {e}，使用默认值")
 
 
 def save_delays_config():
-    """保存延迟配置和热键到 config/delays.json"""
+    """保存延迟配置、热键和OCR设置到 config/delays.json"""
     try:
         with open(DELAYS_PATH, "w", encoding="utf-8") as f:
             json.dump({
                 "delays": DELAYS,
                 "hotkey": _hotkey_to_config(HOTKEY),
                 "multi_destinations": MULTI_DESTINATIONS,
+                "ocr_use_gpu": _ocr_use_gpu,
             }, f, ensure_ascii=False, indent=4)
         log(f"配置已保存: {DELAYS_PATH}")
     except Exception as e:
@@ -219,6 +299,8 @@ def save_delays_config():
 
 # 启动时加载配置
 load_delays_config()
+# 加载配置后，如果有保存的 OCR 模式设置，重新初始化引擎
+_init_ocr_engine(use_gpu=_ocr_use_gpu)
 
 class SYSTEMTIME(ctypes.Structure):
     _fields_ = [
@@ -300,13 +382,22 @@ def restore_time(original: SYSTEMTIME):
 _log_callback = None  # UI 日志回调
 
 
-def log(msg: str):
-    """打印日志并可选推送到 UI"""
+def log(msg: str, verbose: bool = False):
+    """打印日志并推送到 UI 和日志文件
+    verbose=True: 只写文件和控制台，不显示在 UI（调试信息）
+    """
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     line = f"[{timestamp}] {msg}"
     print(line)
-    if _log_callback:
+    if not verbose and _log_callback:
         _log_callback(line)
+    f = _get_log_file()
+    if f:
+        try:
+            f.write(line + "\n")
+            f.flush()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -386,12 +477,12 @@ def find_text_position(img: np.ndarray, target_text: str):
     """在图像中查找目标文字位置，返回 (x, y, w, h) 或 None。
     使用 RapidOCR 直接识别原图，无需预处理。"""
     items = _rapid_ocr(img)
-    log(f"RapidOCR 共识别 {len(items)} 条文字")
+    log(f"RapidOCR 共识别 {len(items)} 条文字", verbose=True)
 
     # --- Pass 1: 精确子串匹配 ---
     for item in items:
         if target_text in item["text"]:
-            log(f"精确匹配 '{target_text}' in '{item["text"]}' → ({item['left']},{item['top']},{item['width']},{item['height']})")
+            log(f"精确匹配 '{target_text}' in '{item["text"]}' → ({item['left']},{item['top']},{item['width']},{item['height']})", verbose=True)
             return (item["left"], item["top"], item["width"], item["height"])
 
     # --- Pass 2: 行拼接匹配 ---
@@ -404,10 +495,10 @@ def find_text_position(img: np.ndarray, target_text: str):
             y = min(i["top"] for i in row_items)
             w = max(i["left"] + i["width"] for i in row_items) - x
             h = max(i["top"] + i["height"] for i in row_items) - y
-            log(f"行拼接匹配 '{target_text}' in '{combined}' → ({x},{y},{w},{h})")
+            log(f"行拼接匹配 '{target_text}' in '{combined}' → ({x},{y},{w},{h})", verbose=True)
             return (x, y, w, h)
 
-    log(f"未找到文字: '{target_text}'")
+    log(f"未找到文字: '{target_text}'", verbose=True)
     return None
 
 
@@ -438,19 +529,19 @@ def find_text_fuzzy_position(img: np.ndarray, target_text: str):
     """模糊查找文字位置（容忍OCR错字）。返回 (x, y, w, h) 或 None"""
     items = _rapid_ocr(img)
     if not items:
-        log("RapidOCR 未识别到任何文字")
+        log("RapidOCR 未识别到任何文字", verbose=True)
         return None
 
     # --- 精确子串匹配 ---
     for item in items:
         if target_text in item["text"]:
-            log(f"模糊-精确匹配 '{target_text}' in '{item['text']}' conf={item['conf']:.2f}")
+            log(f"模糊-精确匹配 '{target_text}' in '{item['text']}' conf={item['conf']:.2f}", verbose=True)
             return (item["left"], item["top"], item["width"], item["height"])
 
     # --- 单条模糊匹配 ---
     for item in items:
         if _fuzzy_match_chinese(target_text, item["text"]):
-            log(f"模糊匹配找到 '{item['text']}' conf={item['conf']:.2f}")
+            log(f"模糊匹配找到 '{item['text']}' conf={item['conf']:.2f}", verbose=True)
             return (item["left"], item["top"], item["width"], item["height"])
 
     # --- 行拼接后模糊匹配 ---
@@ -463,7 +554,7 @@ def find_text_fuzzy_position(img: np.ndarray, target_text: str):
             y = min(i["top"] for i in row_items)
             w = max(i["left"] + i["width"] for i in row_items) - x
             h = max(i["top"] + i["height"] for i in row_items) - y
-            log(f"模糊行拼接匹配 '{combined}' → ({x},{y},{w},{h})")
+            log(f"模糊行拼接匹配 '{combined}' → ({x},{y},{w},{h})", verbose=True)
             return (x, y, w, h)
 
     return None
@@ -513,7 +604,7 @@ def _find_by_landmark(img: np.ndarray, target_text: str):
         # 过滤掉工具窗口中的误检：游戏列表区域的文字高度至少 20px
         # 且位置应在游戏画面中心偏左区域（x < 屏幕50%）
         if h < 20 or x > w_img * 0.5:
-            log(f"地标法: '{landmark_name}' 位置({x},{y},{w},{h}) 不在游戏列表区域，跳过")
+            log(f"地标法: '{landmark_name}' 位置({x},{y},{w},{h}) 不在游戏列表区域，跳过", verbose=True)
             continue
         # 列表项高度估算：地标文字高度 * 3.5（经验值），最少 100px
         item_height = max(int(h * 3.5), 100)
@@ -522,7 +613,7 @@ def _find_by_landmark(img: np.ndarray, target_text: str):
         # 确保不超出屏幕
         target_cy = max(50, min(target_cy, h_img - 50))
         log(f"地标法: '{landmark_name}' 在({x},{y},{w},{h}), "
-            f"推算 '{target_text}' 在({target_cx},{target_cy}), 偏移{offset}项")
+            f"推算 '{target_text}' 在({target_cx},{target_cy}), 偏移{offset}项", verbose=True)
         return (target_cx, target_cy)
     return None
 
@@ -531,7 +622,7 @@ def contains_text(img: np.ndarray, target_text: str) -> bool:
     """检测图像中是否包含指定文字"""
     text = _rapid_ocr_text(img)
     found = target_text in text
-    log(f"RapidOCR 匹配{'OK' if found else 'FAIL'}: '{target_text}'")
+    log(f"RapidOCR 匹配{'OK' if found else 'FAIL'}: '{target_text}'", verbose=True)
     return found
 
 
@@ -540,9 +631,9 @@ def contains_any_text(img: np.ndarray, keywords: list) -> bool:
     text = _rapid_ocr_text(img)
     for kw in keywords:
         if kw in text:
-            log(f"RapidOCR 匹配OK: '{kw}' (从候选: {keywords})")
+            log(f"RapidOCR 匹配OK: '{kw}' (从候选: {keywords})", verbose=True)
             return True
-    log(f"RapidOCR 全部未匹配: {keywords}")
+    log(f"RapidOCR 全部未匹配: {keywords}", verbose=True)
     return False
 
 
@@ -599,7 +690,7 @@ def find_blue_button_text(img: np.ndarray, target_keywords: list):
 
     # 只处理前 10 个最大的候选区域，避免小噪点拖慢速度
     candidates = candidates[:10]
-    log(f"蓝色区域检测: 找到 {len(candidates)} 个候选按钮")
+    log(f"蓝色区域检测: 找到 {len(candidates)} 个候选按钮", verbose=True)
 
     # 用 RapidOCR 识别每个候选区域
     fallback = None
@@ -608,21 +699,21 @@ def find_blue_button_text(img: np.ndarray, target_keywords: list):
         items = _rapid_ocr(roi)
         text = " ".join(item["text"] for item in items)
         if text:
-            log(f"  [{idx+1}/{len(candidates)}] ({x},{y}) {bw}x{bh} → '{text}'")
+            log(f"[{idx+1}/{len(candidates)}] ({x},{y}) {bw}x{bh} → '{text}'", verbose=True)
         for kw in target_keywords:
             if kw in text:
                 cx, cy = x + bw // 2, y + bh // 2
                 if len(text) <= len(kw) + 2:
-                    log(f"蓝色按钮RapidOCR 精确OK: '{kw}' in '{text}' at ({cx},{cy})")
+                    log(f"蓝色按钮RapidOCR 精确OK: '{kw}' in '{text}' at ({cx},{cy})", verbose=True)
                     return (cx, cy)
                 if fallback is None:
                     fallback = (cx, cy, kw, text)
                 break
     if fallback:
         cx, cy, kw, text = fallback
-        log(f"蓝色按钮RapidOCR 宽松OK: '{kw}' in '{text}' at ({cx},{cy})")
+        log(f"蓝色按钮RapidOCR 宽松OK: '{kw}' in '{text}' at ({cx},{cy})", verbose=True)
         return (cx, cy)
-    log(f"蓝色区域检测: {len(candidates)} 个候选，均未匹配 {target_keywords}")
+    log(f"蓝色区域检测: {len(candidates)} 个候选，均未匹配 {target_keywords}", verbose=True)
     return None
 
 
@@ -687,7 +778,7 @@ def _send_mouse_move(x: int, y: int):
 
 def click_position(x: int, y: int, duration: float = 0.2):
     """移动鼠标到指定位置并点击（使用 SendInput 底层 API，兼容 DirectInput 游戏）"""
-    log(f"移动鼠标到 ({x}, {y}) 并点击")
+    log(f"移动鼠标到 ({x}, {y}) 并点击", verbose=True)
     # 先用 pyautogui 平滑移动（让玩家能看到光标）
     try:
         pyautogui.moveTo(x, y, duration=duration)
@@ -774,7 +865,7 @@ def scroll_down(pages: int = 1):
     """控制滚轮向下翻页（使用 SendInput 底层 API，兼容游戏）"""
     # 每页滚动 5 个刻度 = 5 * 120 = 600, 负数=向下
     scroll_val = -WHEEL_DELTA * 5 * pages
-    log(f"滚轮向下翻 {pages} 页 (scroll={scroll_val})")
+    log(f"滚轮向下翻 {pages} 页 (scroll={scroll_val})", verbose=True)
     _send_mouse_wheel(scroll_val)
 
 
@@ -787,7 +878,7 @@ def scroll_notches(count: int):
 def scroll_up(pages: int = 1):
     """控制滚轮向上翻页"""
     scroll_val = WHEEL_DELTA * 5 * pages
-    log(f"滚轮向上翻 {pages} 页 (scroll={scroll_val})")
+    log(f"滚轮向上翻 {pages} 页 (scroll={scroll_val})", verbose=True)
     _send_mouse_wheel(scroll_val)
 
 
@@ -845,7 +936,7 @@ def _send_postmessage_key(hwnd, vk, scan):
 
 def press_key(key: str):
     """发送按键：先激活窗口用 SendInput，失败则用 PostMessage"""
-    log(f"按下按键: {key}")
+    log(f"按下按键: {key}", verbose=True)
 
     entry = KEY_MAP.get(key.lower())
     if entry is None:
@@ -862,15 +953,15 @@ def press_key(key: str):
         time.sleep(0.05)
 
     if _send_input_key(vk, scan):
-        log(f"  -> SendInput 成功")
+        log(f"  -> SendInput 成功", verbose=True)
         return
 
     # 方法 2: SendInput 失败，用 PostMessage
     if hwnd:
-        log(f"  -> SendInput 失败，改用 PostMessage")
+        log(f"  -> SendInput 失败，改用 PostMessage", verbose=True)
         _send_postmessage_key(hwnd, vk, scan)
     else:
-        log(f"  -> 未找到游戏窗口，尝试 pyautogui")
+        log(f"  -> 未找到游戏窗口，尝试 pyautogui", verbose=True)
         pyautogui.press(key)
 
 
@@ -902,9 +993,6 @@ DESTINATION_LANDMARKS = {
     "天坠魔窟": [("天阳乡浮岛", -1), ("世界树地下都市遗址", -2)],
 }
 
-# 多选目的地配置（6个槽位，None 表示"无"）
-MULTI_DESTINATIONS = [None] * 6
-
 # 所有可选目的地（含"无"）
 ALL_DESTINATIONS_WITH_NONE = ["（无）"] + DESTINATIONS_PAGE1 + DESTINATIONS_PAGE2
 
@@ -921,6 +1009,8 @@ class AutoExpedition:
         self.multi_destinations = []     # 多选目的地列表
         self.original_time = None
         self._real_time = None           # 真实时间（用于最后恢复）
+        self.auto_restart = False        # 流程失败后自动重启
+        self._user_stopped = False       # 是否是用户手动停止
 
     def _restore_real_time(self):
         """恢复到当前真实时间（补偿期间经过的时间）"""
@@ -955,7 +1045,8 @@ class AutoExpedition:
         threading.Thread(target=self._run_loop, daemon=True).start()
 
     def stop(self):
-        """停止自动化流程"""
+        """停止自动化流程（用户主动调用）"""
+        self._user_stopped = True
         self.running = False
         log("已请求停止，等待当前循环结束...")
 
@@ -998,9 +1089,19 @@ class AutoExpedition:
                     log("本次流程完成，准备下一轮...")
                     time.sleep(0.5)
         finally:
+            should_restart = (
+                self.auto_restart
+                and not self._user_stopped  # 非用户手动停止
+            )
             self.running = False
             self._lock.release()
-            log("自动化流程已结束")
+            if should_restart:
+                log("自动化流程异常结束，自动重启中...")
+                time.sleep(3)
+                self._user_stopped = False
+                self.start()
+            else:
+                log("自动化流程已结束")
 
     def _run_once(self) -> bool:
         """执行一次完整的远征流程，返回是否成功"""
@@ -1050,10 +1151,9 @@ class AutoExpedition:
             if contains_any_text(img, OPEN_KEYWORDS):
                 log("检测到'打开'提示，F键可能未生效，重新按下F...")
                 time.sleep(0.3)
-                send_key("f")
+                press_key("f")
                 time.sleep(DELAYS["detection_retry"] * 2)
                 img = take_screenshot()
-                save_debug_screenshot(img, "step4_repF")
                 if not contains_any_text(img, EXPEDITION_KEYWORDS):
                     log("重新按F后仍未检测到远征界面，停止运行")
                     return False
@@ -1061,7 +1161,6 @@ class AutoExpedition:
                 log(f"第一次未检测到远征界面，等待 {DELAYS['detection_retry']*2}s 后重试...")
                 time.sleep(DELAYS["detection_retry"] * 2)
                 img2 = take_screenshot()
-                save_debug_screenshot(img2, "step4_retry")
                 if not contains_any_text(img2, EXPEDITION_KEYWORDS):
                     log("第二次仍未检测到远征界面，停止运行")
                     return False
@@ -1070,7 +1169,6 @@ class AutoExpedition:
         DISPATCH_KEYWORDS = ["请选择派遣帕鲁远征的目的地", "派遣帕鲁远征", "选择目的", "目的地"]
         log("[步骤5] 检测派遣界面")
         img = take_screenshot()
-        save_debug_screenshot(img, "step5")
 
         if contains_any_text(img, DISPATCH_KEYWORDS):
             # ---- 步骤 6：根据目的地选择 ----
@@ -1093,7 +1191,6 @@ class AutoExpedition:
             log("蓝色按钮检测未找到，用全图OCR+行拼接匹配...")
             time.sleep(DELAYS["detection_retry"])
             img = take_screenshot()
-            save_debug_screenshot(img, "step7_retry")
             pos = find_text_position(img, "自动指派")
             if not pos:
                 pos = find_text_fuzzy_position(img, "自动指派")
@@ -1107,7 +1204,6 @@ class AutoExpedition:
         log(f"[步骤7.5] 等待 {DELAYS['step7_dispatch_wait']}s，检测派遣帕鲁界面")
         time.sleep(DELAYS["step7_dispatch_wait"])
         img = take_screenshot()
-        save_debug_screenshot(img, "step7_5")
         if contains_any_text(img, ["派遣帕鲁", "选择帕鲁", "帕鲁"]):
             log("检测到派遣帕鲁界面，等待自动指派完成...")
             # 自动指派已点过，等几秒让它自动选完帕鲁
@@ -1139,7 +1235,6 @@ class AutoExpedition:
         if not pos:
             log("蓝色区域未找到 '开始'，尝试全图 OCR...")
             img = take_screenshot()
-            save_debug_screenshot(img, "step9_ocr")
             pos = find_any_text_position(img, START_KEYWORDS)
 
         if not pos:
@@ -1148,7 +1243,6 @@ class AutoExpedition:
             pos = find_blue_button_in_screenshot(START_KEYWORDS, "step9_retry")
             if not pos:
                 img = take_screenshot()
-                save_debug_screenshot(img, "step9_retry_ocr")
                 pos = find_any_text_position(img, START_KEYWORDS)
             if not pos:
                 log("第二次仍未找到 '开始'，停止运行")
@@ -1190,7 +1284,6 @@ class AutoExpedition:
 
             # 检测结果
             img = take_screenshot()
-            save_debug_screenshot(img, f"step9_5_attempt{attempt}")
 
             # 情况1: 远征完成 → 恢复真实时间，进入步骤10
             if contains_any_text(img, ["物品栏", "领取", "奖励", "完成"]):
@@ -1220,7 +1313,6 @@ class AutoExpedition:
             press_key("f")
             time.sleep(DELAYS["step12_detect_wait"])
             img = take_screenshot()
-            save_debug_screenshot(img, f"step12_f{f_attempt}")
             if contains_any_text(img, ["物品栏"]):
                 log("检测到物品栏")
                 menu_opened = True
@@ -1258,14 +1350,13 @@ class AutoExpedition:
             """只移动鼠标到列表中心（不点击），然后滚动"""
             _send_mouse_move(list_x, list_y)
             time.sleep(0.1)
-            log(f"滚动 {notches} 格")
+            log(f"滚动 {notches} 格", verbose=True)
             scroll_notches(notches)
             time.sleep(0.5)  # 等500ms让列表滚动到位
 
         def _try_find():
             """截图识别目标文字，返回中心坐标或None"""
             img = take_screenshot()
-            save_debug_screenshot(img, "step6")
             # 先精确查找
             pos = find_text_fuzzy_center(img, dest)
             if pos:
@@ -1448,6 +1539,14 @@ class App:
 
         ttk.Button(frame_mid, text="停止", command=self._stop).pack(side="left", padx=5)
 
+        # 自动重启勾选框
+        self.auto_restart_var = tk.BooleanVar(value=False)
+        self.auto_restart_cb = ttk.Checkbutton(
+            frame_mid, text="失败后自动重启", variable=self.auto_restart_var,
+            command=self._on_auto_restart_change
+        )
+        self.auto_restart_cb.pack(side="left", padx=15)
+
         self.hotkey_btn = ttk.Button(
             frame_mid, text=f"热键: {_key_to_display(HOTKEY)}",
             command=self._start_bind_hotkey, width=16
@@ -1461,18 +1560,39 @@ class App:
         frame_ocr = ttk.LabelFrame(self.root, text="OCR 引擎", padding=10)
         frame_ocr.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(frame_ocr, text=f"RapidOCR 已加载 ({_ocr_backend})", foreground="green").pack(side="left")
+        self.ocr_status_label = ttk.Label(frame_ocr, text=f"RapidOCR ({_ocr_backend})", foreground="green")
+        self.ocr_status_label.pack(side="left")
+
+        # GPU/CPU 切换按钮（仅在 DirectML 可用时显示）
+        if _DML_AVAILABLE:
+            self.ocr_mode_var = tk.StringVar(value="GPU" if _ocr_use_gpu else "CPU")
+            ocr_combo = ttk.Combobox(
+                frame_ocr, textvariable=self.ocr_mode_var,
+                values=["GPU", "CPU"], state="readonly", width=6
+            )
+            ocr_combo.pack(side="left", padx=10)
+            ocr_combo.bind("<<ComboboxSelected>>", self._on_ocr_mode_change)
+        else:
+            ttk.Label(frame_ocr, text="(DirectML 不可用，仅 CPU)", foreground="gray").pack(side="left", padx=10)
 
         # ---- 缓存管理 ----
         frame_cache = ttk.LabelFrame(self.root, text="缓存管理", padding=10)
         frame_cache.pack(fill="x", padx=10, pady=5)
 
         ttk.Label(frame_cache, text=f"配置目录: {CONFIG_DIR}", foreground="gray").pack(anchor="w")
-        self.cache_label = ttk.Label(frame_cache, text="截图缓存: 计算中...")
-        self.cache_label.pack(side="left")
 
-        ttk.Button(frame_cache, text="刷新", command=self._refresh_cache_size).pack(side="left", padx=10)
-        ttk.Button(frame_cache, text="清除缓存", command=self._clear_cache).pack(side="left", padx=5)
+        cache_sub = ttk.Frame(frame_cache)
+        cache_sub.pack(fill="x", pady=2)
+        self.cache_label = ttk.Label(cache_sub, text="截图缓存: 计算中...")
+        self.cache_label.pack(side="left")
+        ttk.Button(cache_sub, text="刷新", command=self._refresh_cache_size).pack(side="left", padx=10)
+        ttk.Button(cache_sub, text="清除缓存", command=self._clear_cache).pack(side="left", padx=5)
+
+        log_sub = ttk.Frame(frame_cache)
+        log_sub.pack(fill="x", pady=2)
+        self.log_size_label = ttk.Label(log_sub, text="日志文件: 计算中...")
+        self.log_size_label.pack(side="left")
+        ttk.Button(log_sub, text="打开日志目录", command=lambda: os.startfile(os.path.abspath(LOG_DIR))).pack(side="left", padx=10)
 
         self._refresh_cache_size()
 
@@ -1609,8 +1729,22 @@ class App:
         else:
             self._start()
 
+    def _on_auto_restart_change(self):
+        """自动重启勾选框变更"""
+        _expedition.auto_restart = self.auto_restart_var.get()
+        _expedition._user_stopped = False
+        status = "开启" if _expedition.auto_restart else "关闭"
+        log(f"失败后自动重启: {status}")
+
+    def _on_ocr_mode_change(self, event=None):
+        """OCR GPU/CPU 切换"""
+        use_gpu = self.ocr_mode_var.get() == "GPU"
+        _init_ocr_engine(use_gpu=use_gpu)
+        self.ocr_status_label.config(text=f"RapidOCR ({_ocr_backend})")
+
     def _start(self):
         """开始"""
+        _expedition._user_stopped = False  # 每次启动时重置
         dest = self.dest_var.get()
         if dest == "多选":
             # 多选模式
@@ -1672,9 +1806,19 @@ class App:
             return f"{size_bytes / (1024 * 1024):.1f} MB"
 
     def _refresh_cache_size(self):
-        """刷新缓存大小显示"""
+        """刷新缓存大小和日志文件大小显示"""
         total, count = self._get_cache_size()
         self.cache_label.config(text=f"截图缓存: {count} 个文件, {self._format_size(total)}")
+        # 日志文件大小
+        log_total = 0
+        log_count = 0
+        if os.path.isdir(LOG_DIR):
+            for f in os.listdir(LOG_DIR):
+                fp = os.path.join(LOG_DIR, f)
+                if os.path.isfile(fp) and f.endswith(".log"):
+                    log_total += os.path.getsize(fp)
+                    log_count += 1
+        self.log_size_label.config(text=f"日志: {log_count} 个文件, {self._format_size(log_total)}")
 
     def _clear_cache(self):
         """清除截图缓存"""
@@ -1752,10 +1896,28 @@ if __name__ == "__main__":
     else:
         print("  [OK] 已以管理员权限运行")
 
+    print(f"  日志文件: {_log_file_path}")
     print(f"  OCR 引擎: RapidOCR ({_ocr_backend})")
     print(f"  RapidOCR 引擎首次加载较慢（约5-10秒），属正常现象")
     print("=" * 50)
     print()
 
+    # 写入会话开始日志
+    log(f"===== 会话开始 =====")
+    log(f"版本: {VERSION}")
+    log(f"OCR 引擎: RapidOCR ({_ocr_backend})")
+    log(f"DirectML 可用: {_DML_AVAILABLE}")
+    log(f"管理员权限: {_is_admin}")
+    log(f"配置目录: {CONFIG_DIR}")
+
     app = App()
-    app.run()
+    try:
+        app.run()
+    finally:
+        log("===== 会话结束 =====")
+        # 关闭日志文件
+        if _log_file:
+            try:
+                _log_file.close()
+            except Exception:
+                pass
