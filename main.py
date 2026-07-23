@@ -25,7 +25,7 @@ from PIL import ImageGrab
 # 全局配置
 # ============================================================
 
-VERSION = "v0.2-beta"
+VERSION = "v0.3-beta"
 
 # RapidOCR 引擎 (ONNX Runtime, CPU/DirectML 加速)
 import onnxruntime as ort
