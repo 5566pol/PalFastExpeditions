@@ -6,18 +6,18 @@ echo ============================================
 echo.
 
 :: 检查虚拟环境
-if not exist "venv\Scripts\python.exe" (
-    echo [错误] 未找到虚拟环境，请先运行: python -m venv venv
+if not exist ".venv\Scripts\python.exe" (
+    echo [错误] 未找到虚拟环境，请先运行: python -m venv .venv
     pause
     exit /b 1
 )
 
 :: 安装 PyInstaller
 echo [1/3] 检查 PyInstaller...
-venv\Scripts\pip.exe show pyinstaller >nul 2>&1
+.venv\Scripts\pip.exe show pyinstaller >nul 2>&1
 if errorlevel 1 (
     echo     正在安装 PyInstaller...
-    venv\Scripts\pip.exe install pyinstaller -q
+    .venv\Scripts\pip.exe install pyinstaller -q
 )
 
 :: 清理旧构建
@@ -27,13 +27,14 @@ if exist "build" rmdir /s /q "build"
 
 :: 构建
 echo [3/3] 开始构建...
-venv\Scripts\pyinstaller.exe ^
+.venv\Scripts\pyinstaller.exe ^
     --noconfirm ^
     --onefile ^
     --windowed ^
     --name "PalFastExpeditions" ^
     --add-data "config;config" ^
-    --add-data "venv\Lib\site-packages\rapidocr_onnxruntime;rapidocr_onnxruntime" ^
+    --add-data "pals_list.json;." ^
+    --add-data ".venv\Lib\site-packages\rapidocr_onnxruntime;rapidocr_onnxruntime" ^
     --hidden-import "pynput.keyboard._win32" ^
     --hidden-import "pynput.mouse._win32" ^
     --hidden-import "pynput._util.win32" ^

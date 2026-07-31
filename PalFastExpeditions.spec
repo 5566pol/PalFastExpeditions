@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('config', 'config'), ('venv\\Lib\\site-packages\\rapidocr_onnxruntime', 'rapidocr_onnxruntime')],
+    datas=[('config', 'config'), ('pals_list.json', '.'), ('.venv\\Lib\\site-packages\\rapidocr_onnxruntime', 'rapidocr_onnxruntime')],
     hiddenimports=['pynput.keyboard._win32', 'pynput.mouse._win32', 'pynput._util.win32', 'rapidocr_onnxruntime', 'onnxruntime'],
     hookspath=[],
     hooksconfig={},

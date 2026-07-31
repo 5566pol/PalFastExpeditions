@@ -10,10 +10,10 @@ echo ========================================
 echo.
 
 :: 检查虚拟环境
-if not exist "venv\Scripts\python.exe" (
-    echo [ERROR] venv not found
-    echo   python -m venv venv
-    echo   venv\Scripts\pip install -r requirements.txt
+if not exist ".venv\Scripts\python.exe" (
+    echo [ERROR] .venv not found
+    echo   python -m venv .venv
+    echo   .venv\Scripts\pip install -r requirements.txt
     pause
     exit /b 1
 )
@@ -21,7 +21,7 @@ if not exist "venv\Scripts\python.exe" (
 :: 运行程序
 echo Starting...
 echo.
-venv\Scripts\python.exe main.py
+.venv\Scripts\python.exe main.py
 echo.
 echo Program exited with code: %errorlevel%
 pause

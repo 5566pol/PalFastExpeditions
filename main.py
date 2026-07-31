@@ -37,7 +37,6 @@ _ocr_backend = "CPU"
 
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
-# 日志文件精确到时分秒: logs/2026-07-23_183045.log
 _log_file_path = os.path.join(LOG_DIR, f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.log")
 _log_file = None
 
@@ -117,6 +116,10 @@ _OCR_MAX_WIDTH = 1920
 # 触发热键 (默认 PageDown，可自定义)
 HOTKEY = keyboard.Key.page_down
 _hotkey_binding = False  # True 时下一个按键将被设为热键
+
+# 竞技场热键 (默认 PageUp，可自定义)
+ARENA_HOTKEY = keyboard.Key.page_up
+_arena_hotkey_binding = False  # True 时下一个按键将被设为竞技场热键
 
 # 热键显示名称映射
 _KEY_DISPLAY = {
@@ -249,8 +252,39 @@ DELAY_LABELS = {
 # 多选目的地配置（6个槽位，None 表示"无"）
 MULTI_DESTINATIONS = [None] * 6
 
+# ---- 竞技场配置 ----
+ARENA_PAL_MAIN = ""       # 主战帕鲁 (id 或 name)
+ARENA_PAL_SUB1 = ""       # 辅助帕鲁1
+ARENA_PAL_SUB2 = ""       # 辅助帕鲁2
+ARENA_TIER = "青铜"       # 对手段位
+ARENA_BATTLE_TIME = 120.0  # 帕鲁完战时间（秒，含加载返回世界）
+
 # 当前延迟值（运行时使用）
 DELAYS = dict(DEFAULT_DELAYS)
+
+# 帕鲁图鉴列表 (从 pals_list.json 加载)
+PALS_LIST = []  # [{"id": "1", "name": "棉悠悠"}, ...]
+
+def _load_pals_list():
+    """加载帕鲁图鉴数据"""
+    global PALS_LIST
+    # PyInstaller 打包后，数据文件在 sys._MEIPASS 临时目录中
+    if getattr(sys, 'frozen', False):
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    pals_path = os.path.join(base_dir, "pals_list.json")
+    if os.path.exists(pals_path):
+        try:
+            with open(pals_path, "r", encoding="utf-8") as f:
+                PALS_LIST = json.load(f)
+            print(f"[配置] 已加载帕鲁图鉴: {len(PALS_LIST)} 只")
+        except Exception as e:
+            print(f"[配置] 加载帕鲁图鉴失败: {e}")
+    else:
+        print(f"[配置] 未找到 pals_list.json")
+
+_load_pals_list()
 
 
 def load_delays_config():
@@ -278,11 +312,29 @@ def load_delays_config():
             if "ocr_use_gpu" in data:
                 _ocr_use_gpu = bool(data["ocr_use_gpu"])
                 print(f"[配置] 已加载OCR模式: {'GPU' if _ocr_use_gpu else 'CPU'}")
+            # 竞技场配置
+            global ARENA_HOTKEY, ARENA_PAL_MAIN, ARENA_PAL_SUB1, ARENA_PAL_SUB2
+            global ARENA_TIER, ARENA_BATTLE_TIME
+            if "arena_hotkey" in data:
+                ahk = _parse_hotkey(data["arena_hotkey"])
+                if ahk is not None or data["arena_hotkey"] is None:
+                    ARENA_HOTKEY = ahk
+                print(f"[配置] 已加载竞技场热键: {_key_to_display(ARENA_HOTKEY)}")
+            if "arena_pal_main" in data:
+                ARENA_PAL_MAIN = str(data["arena_pal_main"])
+            if "arena_pal_sub1" in data:
+                ARENA_PAL_SUB1 = str(data["arena_pal_sub1"])
+            if "arena_pal_sub2" in data:
+                ARENA_PAL_SUB2 = str(data["arena_pal_sub2"])
+            if "arena_tier" in data:
+                ARENA_TIER = str(data["arena_tier"])
+            if "arena_battle_time" in data:
+                ARENA_BATTLE_TIME = float(data["arena_battle_time"])
         except Exception as e:
             print(f"[配置] 加载配置失败: {e}，使用默认值")
 
 
-def save_delays_config():
+def save_delays_config(verbose=False):
     """保存延迟配置、热键和OCR设置到 config/delays.json"""
     try:
         with open(DELAYS_PATH, "w", encoding="utf-8") as f:
@@ -291,8 +343,14 @@ def save_delays_config():
                 "hotkey": _hotkey_to_config(HOTKEY),
                 "multi_destinations": MULTI_DESTINATIONS,
                 "ocr_use_gpu": _ocr_use_gpu,
+                "arena_hotkey": _hotkey_to_config(ARENA_HOTKEY),
+                "arena_pal_main": ARENA_PAL_MAIN,
+                "arena_pal_sub1": ARENA_PAL_SUB1,
+                "arena_pal_sub2": ARENA_PAL_SUB2,
+                "arena_tier": ARENA_TIER,
+                "arena_battle_time": ARENA_BATTLE_TIME,
             }, f, ensure_ascii=False, indent=4)
-        log(f"配置已保存: {DELAYS_PATH}")
+        log(f"配置已保存: {DELAYS_PATH}", verbose=verbose)
     except Exception as e:
         log(f"保存配置失败: {e}")
 
@@ -585,6 +643,38 @@ def find_text_fuzzy_in_screenshot(target_text: str, save_name: str = "debug"):
     img = take_screenshot()
     save_debug_screenshot(img, save_name)
     return find_text_fuzzy_center(img, target_text)
+
+
+def find_text_position_in_region(img: np.ndarray, target_text: str, region: tuple):
+    """在指定区域内查找文字位置，返回 (x, y, w, h) 或 None。
+    region = (rx, ry, rw, rh) 相对于原图的裁剪区域。
+    坐标已映射回原图空间。"""
+    rx, ry, rw, rh = region
+    h_img, w_img = img.shape[:2]
+    # 裁剪
+    roi = img[ry:ry + rh, rx:rx + rw]
+    items = _rapid_ocr(roi)
+    # 精确子串匹配
+    for item in items:
+        if target_text in item["text"]:
+            x = item["left"] + rx
+            y = item["top"] + ry
+            log(f"区域匹配 '{target_text}' in '{item['text']}' → ({x},{y},{item['width']},{item['height']})", verbose=True)
+            return (x, y, item["width"], item["height"])
+    # 行拼接匹配
+    rows = _group_items_by_row(items)
+    for row_items in rows:
+        row_items.sort(key=lambda x: x["left"])
+        combined = "".join(i["text"] for i in row_items)
+        if target_text in combined:
+            x = row_items[0]["left"] + rx
+            y = min(i["top"] for i in row_items) + ry
+            w = max(i["left"] + i["width"] for i in row_items) - row_items[0]["left"]
+            h = max(i["top"] + i["height"] for i in row_items) - min(i["top"] for i in row_items)
+            log(f"区域行拼接匹配 '{combined}' → ({x},{y},{w},{h})", verbose=True)
+            return (x, y, w, h)
+    log(f"区域搜索未找到: '{target_text}' in region={region}", verbose=True)
+    return None
 
 
 def _find_by_landmark(img: np.ndarray, target_text: str):
@@ -1426,16 +1516,308 @@ class AutoExpedition:
 
 
 # ============================================================
+# 自动竞技场
+# ============================================================
+
+_arena_log_callback = None  # 竞技场Tab日志回调
+
+def _arena_log(msg: str, verbose: bool = False):
+    """竞技场专用日志"""
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    if not verbose and _arena_log_callback:
+        _arena_log_callback(line)
+    f = _get_log_file()
+    if f:
+        try:
+            f.write(line + "\n")
+            f.flush()
+        except Exception:
+            pass
+
+
+def _show_notification(title: str, message: str):
+    """弹出 Windows 原生通知框（阻塞，用户点确定后返回）"""
+    try:
+        import ctypes as _ct
+        _ct.windll.user32.MessageBoxW(0, message, title, 0x40 | 0x1000)
+    except Exception:
+        pass
+
+
+class AutoArena:
+    def __init__(self):
+        self.running = False
+        self._lock = threading.Lock()
+
+    def start(self):
+        if not self._lock.acquire(blocking=False):
+            _arena_log("已在运行中，忽略重复触发")
+            return
+        self.running = True
+        _arena_log("=" * 50)
+        _arena_log("启动自动竞技场流程")
+        _arena_log(f"主战: {ARENA_PAL_MAIN or '(未设置)'}  辅助: {ARENA_PAL_SUB1 or '(未设置)'}, {ARENA_PAL_SUB2 or '(未设置)'}")
+        _arena_log(f"段位: {ARENA_TIER}  战斗时间: {ARENA_BATTLE_TIME}s")
+        _arena_log("=" * 50)
+        threading.Thread(target=self._run_loop, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+        _arena_log("已请求停止竞技场...")
+
+    def _run_loop(self):
+        try:
+            round_num = 0
+            while self.running:
+                round_num += 1
+                _arena_log(f"======== 第 {round_num} 轮 ========")
+                success = self._run_once()
+                if not self.running:
+                    break
+                if not success:
+                    _arena_log("本轮流程失败，停止运行")
+                    _show_notification("PalFastExpeditions 竞技场", f"第 {round_num} 轮操作失败，已停止自动竞技场。")
+                    break
+                _arena_log(f"第 {round_num} 轮完成，等待 {ARENA_BATTLE_TIME}s 后开始下一轮...")
+                # 可中断等待
+                wait_end = time.monotonic() + ARENA_BATTLE_TIME
+                while self.running and time.monotonic() < wait_end:
+                    time.sleep(0.5)
+        finally:
+            self.running = False
+            self._lock.release()
+            _arena_log("自动竞技场流程已结束")
+
+    def _run_once(self) -> bool:
+        """执行一轮竞技场操作"""
+        # 步骤1
+        if not self._step1_click_challenge():
+            return False
+        if not self.running:
+            return False
+        # 步骤2
+        if not self._step2_select_tier():
+            return False
+        if not self.running:
+            return False
+        # 步骤3
+        if not self._step3_select_pals():
+            return False
+        if not self.running:
+            return False
+        return True
+
+    # ---- 步骤1：按F → 截图 → 点击"挑战" ----
+    def _step1_click_challenge(self) -> bool:
+        _arena_log("[步骤1] 按下F键")
+        press_key("f")
+        time.sleep(0.3)
+        img = take_screenshot()
+        save_debug_screenshot(img, "arena_step1")
+        pos = find_text_position(img, "挑战")
+        if not pos:
+            _arena_log("[步骤1] 第一次未找到'挑战'，重试...")
+            time.sleep(1)
+            img = take_screenshot()
+            save_debug_screenshot(img, "arena_step1_retry")
+            pos = find_text_position(img, "挑战")
+        if not pos:
+            _arena_log("[步骤1] 未找到'挑战'按钮")
+            return False
+        cx, cy = pos[0] + pos[2] // 2, pos[1] + pos[3] // 2
+        _arena_log(f"[步骤1] 点击'挑战' ({cx},{cy})")
+        click_position(cx, cy)
+        return True
+
+    # ---- 步骤2：等待 → 点击段位卡 → 确认"是" → 等10s ----
+    def _step2_select_tier(self) -> bool:
+        _arena_log("[步骤2] 等待300ms后选择段位")
+        time.sleep(0.3)
+        img = take_screenshot()
+        save_debug_screenshot(img, "arena_step2")
+        # 匹配段位卡（如"白银 Lv.30"）
+        pos = self._find_tier_card(img, ARENA_TIER)
+        if not pos:
+            _arena_log("[步骤2] 第一次未找到段位卡，重试...")
+            time.sleep(1)
+            img = take_screenshot()
+            save_debug_screenshot(img, "arena_step2_retry")
+            pos = self._find_tier_card(img, ARENA_TIER)
+        if not pos:
+            _arena_log(f"[步骤2] 未找到段位: {ARENA_TIER}")
+            return False
+        cx, cy = pos[0] + pos[2] // 2, pos[1] + pos[3] // 2
+        _arena_log(f"[步骤2] 点击段位 '{ARENA_TIER}' ({cx},{cy})")
+        click_position(cx, cy)
+        # 等待确认框
+        time.sleep(1)
+        img = take_screenshot()
+        save_debug_screenshot(img, "arena_step2_confirm")
+        pos2 = self._find_confirm_yes(img)
+        if not pos2:
+            _arena_log("[步骤2] 未找到确认按钮'是'，重试...")
+            time.sleep(1)
+            img = take_screenshot()
+            save_debug_screenshot(img, "arena_step2_confirm_retry")
+            pos2 = self._find_confirm_yes(img)
+        if not pos2:
+            _arena_log("[步骤2] 未找到确认按钮'是'")
+            return False
+        cx2, cy2 = pos2[0] + pos2[2] // 2, pos2[1] + pos2[3] // 2
+        _arena_log(f"[步骤2] 点击'是' ({cx2},{cy2})")
+        click_position(cx2, cy2)
+        _arena_log("[步骤2] 等待10s加载...")
+        time.sleep(10)
+        return True
+
+    # ---- 步骤3：选择3只帕鲁 → 点击"准备完毕" ----
+    def _step3_select_pals(self) -> bool:
+        _arena_log("[步骤3] 选择出战帕鲁")
+        pal_list = [
+            ("主战", ARENA_PAL_MAIN, 4),   # 主战最多重试4次
+            ("辅助1", ARENA_PAL_SUB1, 1),  # 辅助最多重试1次
+            ("辅助2", ARENA_PAL_SUB2, 1),
+        ]
+        for role, pal_name, retries in pal_list:
+            if not self.running:
+                return False
+            if not pal_name:
+                continue
+            if not self._click_pal_in_list(pal_name, max_retries=retries):
+                _arena_log(f"[步骤3] 未找到{role}帕鲁: {pal_name}")
+                return False
+            time.sleep(0.05)
+        # 点击"准备完毕"
+        time.sleep(0.1)
+        if not self.running:
+            return False
+        if not self._click_ready_button():
+            return False
+        return True
+
+    # ---- 辅助方法 ----
+
+    def _find_tier_card(self, img, tier_name: str):
+        """匹配段位卡，格式如'白银 Lv.30'，排除左上角当前段位"""
+        TIER_LEVELS = {"青铜": "20", "白银": "30", "黄金": "40", "铂金": "50",
+                       "钻石": "60", "大师": "65", "传奇": "80"}
+        level = TIER_LEVELS.get(tier_name, "")
+        if level:
+            card_text = f"{tier_name} Lv.{level}"
+            items = _rapid_ocr(img)
+            for item in items:
+                if card_text in item["text"] and item["top"] > 200:
+                    return (item["left"], item["top"], item["width"], item["height"])
+        # 回退：只匹配段位名，要求 y > 200
+        items = _rapid_ocr(img)
+        for item in items:
+            if tier_name in item["text"] and item["top"] > 200:
+                return (item["left"], item["top"], item["width"], item["height"])
+        return None
+
+    def _find_confirm_yes(self, img):
+        """查找确认框中的'是'按钮"""
+        pos = find_blue_button_text(img, ["是"])
+        if pos:
+            return (pos[0] - 15, pos[1] - 10, 30, 20)
+        pos2 = find_text_position(img, "是")
+        return pos2
+
+    def _click_pal_in_list(self, pal_name: str, max_retries: int = 0) -> bool:
+        """在左侧帕鲁列表中找到并点击指定帕鲁（OCR模糊匹配，处理截断和错字）
+        max_retries: 最大重试次数（每次重试会重新截图识别）
+        """
+        # ID → 名称：如果传入的是编号(如"195b")，转成帕鲁名
+        search_name = pal_name
+        pal_id = pal_name  # 保留原始值用于文件名
+        for pal in PALS_LIST:
+            if pal["id"] == pal_name:
+                search_name = pal["name"]
+                break
+            elif pal["name"] == pal_name:
+                pal_id = pal["id"]  # 名称→ID，确保文件名是ASCII
+                break
+        _arena_log(f"[帕鲁] 搜索 '{search_name}' (ID:{pal_id})", verbose=True)
+
+        screen_w, screen_h = pyautogui.size()
+        left_limit = screen_w // 2
+
+        for attempt in range(1 + max_retries):
+            img = take_screenshot()
+            save_debug_screenshot(img, f"arena_pal_{pal_id}_{attempt}")
+            items = _rapid_ocr(img)
+            left_items = [i for i in items if i["left"] <= left_limit]
+            _arena_log(f"[帕鲁] 左半屏识别到 {len(left_items)} 条: {[i['text'] for i in left_items]}", verbose=True)
+
+            best = None  # (score, item)
+            for item in items:
+                if item["left"] > left_limit:
+                    continue
+                text = item["text"]
+                # 完全包含
+                if search_name in text or text in search_name:
+                    score = 100
+                # OCR截断：OCR结果是目标名的子串(如"贝拉"⊂"贝菈露洁")
+                elif len(text) >= 2 and text in search_name:
+                    score = 80
+                # 字符重叠率：处理OCR错字
+                else:
+                    overlap = len(set(search_name) & set(text))
+                    ratio = overlap / len(search_name) if search_name else 0
+                    score = int(ratio * 60) if ratio >= 0.5 else 0
+                if score > 0 and (best is None or score > best[0]):
+                    best = (score, item)
+
+            if best:
+                _, item = best
+                cx = item["left"] + item["width"] // 2
+                cy = item["top"] + item["height"] // 2
+                ocr_text = item["text"]
+                _arena_log(f"[帕鲁] 点击 '{search_name}' (识别为'{ocr_text}') ({cx},{cy})")
+                click_position(cx, cy)
+                return True
+
+            if attempt < max_retries:
+                _arena_log(f"[帕鲁] '{search_name}' 未找到，重试 ({attempt + 1}/{max_retries})")
+                time.sleep(1)
+
+        _arena_log(f"[帕鲁] 未找到 '{search_name}'")
+        return False
+
+    def _click_ready_button(self) -> bool:
+        """点击我方（左侧）的蓝底白字'准备完毕'按钮（限制在左半屏搜索）"""
+        screen_w, screen_h = pyautogui.size()
+        # 搜索区域：左半屏的下半部分
+        left_region = (0, screen_h // 2, screen_w // 2, screen_h // 2)
+        for attempt in range(3):
+            img = take_screenshot()
+            pos = find_text_position_in_region(img, "准备完毕", region=left_region)
+            if pos:
+                cx, cy = pos[0] + pos[2] // 2, pos[1] + pos[3] // 2
+                _arena_log(f"[准备完毕] 点击 ({cx},{cy}) [尝试{attempt + 1}]")
+                click_position(cx, cy)
+                return True
+            if attempt < 2:
+                _arena_log("[准备完毕] 未找到，重试...", verbose=True)
+                time.sleep(0.5)
+        _arena_log("[准备完毕] 多次尝试后仍未找到")
+        return False
+
+
+# ============================================================
 # 热键监听
 # ============================================================
 
 _expedition = AutoExpedition()
+_arena = AutoArena()
 _listener = None
 _app_ref = None  # App 实例引用（用于从监听线程更新 UI）
 
 
 def on_press(key):
-    global _expedition, _hotkey_binding
+    global _expedition, _hotkey_binding, _arena_hotkey_binding
     try:
         if _hotkey_binding:
             if key == keyboard.Key.esc:
@@ -1444,13 +1826,34 @@ def on_press(key):
                 _apply_hotkey(key)
             _hotkey_binding = False
             return
+        # 竞技场热键
+        if _arena_hotkey_binding:
+            if key == keyboard.Key.esc:
+                _apply_arena_hotkey(None)
+            else:
+                _apply_arena_hotkey(key)
+            _arena_hotkey_binding = False
+            return
+        # 远征热键：仅在自动远征 Tab 时响应
         if HOTKEY is not None and key == HOTKEY:
+            if _app_ref and _app_ref._current_tab != "expedition":
+                return  # 不在远征 Tab，忽略
             if _expedition.running:
                 if _app_ref:
                     _app_ref.root.after(0, _app_ref._stop)
             else:
                 if _app_ref:
                     _app_ref.root.after(0, _app_ref._start)
+        # 竞技场热键响应：仅在自动竞技场 Tab 时响应
+        if ARENA_HOTKEY is not None and key == ARENA_HOTKEY:
+            if _app_ref and _app_ref._current_tab != "arena":
+                return  # 不在竞技场 Tab，忽略
+            if _arena.running:
+                if _app_ref:
+                    _app_ref.root.after(0, _app_ref._stop_arena)
+            else:
+                if _app_ref:
+                    _app_ref.root.after(0, _app_ref._start_arena)
     except Exception as e:
         log(f"热键处理错误: {e}")
 
@@ -1465,6 +1868,17 @@ def _apply_hotkey(key):
     # 通过 after 在主线程更新 UI
     if _app_ref:
         _app_ref.root.after(0, _app_ref._apply_hotkey_ui, key)
+
+
+def _apply_arena_hotkey(key):
+    """应用新竞技场热键（从 on_press 调用）"""
+    global ARENA_HOTKEY
+    ARENA_HOTKEY = key
+    display = _key_to_display(key)
+    save_delays_config()
+    log(f"竞技场热键已设置为: {display}")
+    if _app_ref:
+        _app_ref.root.after(0, _app_ref._apply_arena_hotkey_ui, key)
 
 
 def start_hotkey_listener():
@@ -1486,6 +1900,7 @@ class App:
         self.root.title(f"PalFastExpeditions {VERSION}")
         self.root.geometry("800x900")
         self.root.resizable(True, True)
+        self._current_tab = "expedition"  # 当前活动标签页
 
         # 设置图标和样式
         style = ttk.Style()
@@ -1502,9 +1917,18 @@ class App:
         start_hotkey_listener()
 
     def _build_ui(self):
-        """构建 UI"""
+        """构建 UI（Notebook 双标签页）"""
+        # ---- Notebook 容器 ----
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
+        tab1 = ttk.Frame(self.notebook)
+        tab2 = ttk.Frame(self.notebook)
+        self.notebook.add(tab1, text="  自动远征  ")
+        self.notebook.add(tab2, text="  自动竞技场  ")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         # ---- 顶部：目的地选择 ----
-        frame_top = ttk.LabelFrame(self.root, text="目的地设置", padding=10)
+        frame_top = ttk.LabelFrame(tab1, text="目的地设置", padding=10)
         frame_top.pack(fill="x", padx=10, pady=5)
 
         ttk.Label(frame_top, text="选择远征目的地:").pack(side="left")
@@ -1531,7 +1955,7 @@ class App:
         self._update_multi_status()
 
         # ---- 中部：控制按钮 ----
-        frame_mid = ttk.LabelFrame(self.root, text="控制", padding=10)
+        frame_mid = ttk.LabelFrame(tab1, text="控制", padding=10)
         frame_mid.pack(fill="x", padx=10, pady=5)
 
         self.btn_start = ttk.Button(frame_mid, text="开始", command=self._toggle)
@@ -1557,7 +1981,7 @@ class App:
         self.status_label.pack(side="right", padx=10)
 
         # ---- RapidOCR 状态 ----
-        frame_ocr = ttk.LabelFrame(self.root, text="OCR 引擎", padding=10)
+        frame_ocr = ttk.LabelFrame(tab1, text="OCR 引擎", padding=10)
         frame_ocr.pack(fill="x", padx=10, pady=5)
 
         self.ocr_status_label = ttk.Label(frame_ocr, text=f"RapidOCR ({_ocr_backend})", foreground="green")
@@ -1576,7 +2000,7 @@ class App:
             ttk.Label(frame_ocr, text="(DirectML 不可用，仅 CPU)", foreground="gray").pack(side="left", padx=10)
 
         # ---- 缓存管理 ----
-        frame_cache = ttk.LabelFrame(self.root, text="缓存管理", padding=10)
+        frame_cache = ttk.LabelFrame(tab1, text="缓存管理", padding=10)
         frame_cache.pack(fill="x", padx=10, pady=5)
 
         ttk.Label(frame_cache, text=f"配置目录: {CONFIG_DIR}", foreground="gray").pack(anchor="w")
@@ -1597,7 +2021,7 @@ class App:
         self._refresh_cache_size()
 
         # ---- 延迟设置 ----
-        frame_delay = ttk.LabelFrame(self.root, text="延迟设置 (秒)", padding=10)
+        frame_delay = ttk.LabelFrame(tab1, text="延迟设置 (秒)", padding=10)
         frame_delay.pack(fill="x", padx=10, pady=5)
 
         self.delay_vars = {}
@@ -1619,7 +2043,7 @@ class App:
         ttk.Button(btn_delay_frame, text="恢复默认", command=self._reset_delays).pack(side="left", padx=5)
 
         # ---- 底部：日志 ----
-        frame_log = ttk.LabelFrame(self.root, text="运行日志", padding=5)
+        frame_log = ttk.LabelFrame(tab1, text="运行日志", padding=5)
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.log_text = tk.Text(frame_log, height=15, wrap="word", font=("Consolas", 9))
@@ -1631,11 +2055,14 @@ class App:
         # ---- 底部提示 ----
         hk_name = _key_to_display(HOTKEY)
         self.tip_label = ttk.Label(
-            self.root,
+            tab1,
             text=f"按 {hk_name} 开始/停止",
             foreground="blue"
         )
         self.tip_label.pack(pady=3)
+
+        # ========== Tab2: 自动竞技场 ==========
+        self._build_arena_tab(tab2)
 
     def _setup_logging(self):
         """将日志输出到 UI"""
@@ -1783,6 +2210,237 @@ class App:
         self.tip_label.config(
             text=f"提示: 按 {hk_name} 开始/停止 | 确保以管理员权限运行 | 鼠标移到屏幕左上角可紧急停止"
         )
+
+    # ---- 竞技场 Tab 相关方法 ----
+
+    def _on_tab_changed(self, event=None):
+        """标签页切换回调"""
+        tab_text = self.notebook.tab(self.notebook.select(), "text").strip()
+        if tab_text == "自动远征":
+            self._current_tab = "expedition"
+        elif tab_text == "自动竞技场":
+            self._current_tab = "arena"
+
+    def _apply_arena_hotkey_ui(self, key):
+        """竞技场热键绑定完成后更新 UI"""
+        display = _key_to_display(key)
+        self.arena_hotkey_btn.config(text=f"热键: {display}")
+
+    def _validate_pal_input(self, var, field_name):
+        """验证帕鲁输入：必须是 pals_list.json 中的 id 或 name"""
+        val = var.get().strip()
+        if not val:
+            return True  # 允许为空
+        # 检查是否是有效 id 或 name
+        for pal in PALS_LIST:
+            if val == pal["id"] or val == pal["name"]:
+                return True
+        messagebox.showwarning("输入无效", f"{field_name}：'{val}' 不在帕鲁图鉴中\n请输入有效的帕鲁编号(如 5)或名称(如 冲浪鸭)")
+        return False
+
+    def _on_arena_pal_validate(self, event, var, field_name):
+        """输入框失焦时验证并自动保存"""
+        self._validate_pal_input(var, field_name)
+        self._auto_save_arena()
+
+    def _build_arena_tab(self, parent):
+        """构建自动竞技场 Tab UI"""
+        # ---- 帕鲁选择 ----
+        frame_pal = ttk.LabelFrame(parent, text="帕鲁选择", padding=10)
+        frame_pal.pack(fill="x", padx=10, pady=5)
+
+        self.arena_pal_main_var = tk.StringVar(value=ARENA_PAL_MAIN)
+        self.arena_pal_sub1_var = tk.StringVar(value=ARENA_PAL_SUB1)
+        self.arena_pal_sub2_var = tk.StringVar(value=ARENA_PAL_SUB2)
+
+        pal_names = [p["name"] for p in PALS_LIST]
+
+        row_main = ttk.Frame(frame_pal)
+        row_main.pack(fill="x", pady=3)
+        ttk.Label(row_main, text="主战帕鲁:", width=10).pack(side="left")
+        self.arena_pal_main_entry = ttk.Combobox(
+            row_main, textvariable=self.arena_pal_main_var,
+            values=pal_names, width=20
+        )
+        self.arena_pal_main_entry.pack(side="left", padx=5)
+        self.arena_pal_main_entry.bind("<FocusOut>",
+            lambda e: self._on_arena_pal_validate(e, self.arena_pal_main_var, "主战帕鲁"))
+        self.arena_pal_main_entry.bind("<<ComboboxSelected>>", self._auto_save_arena)
+        ttk.Label(row_main, text="(输入帕鲁编号或名称)", foreground="gray").pack(side="left", padx=5)
+
+        row_sub1 = ttk.Frame(frame_pal)
+        row_sub1.pack(fill="x", pady=3)
+        ttk.Label(row_sub1, text="辅助帕鲁1:", width=10).pack(side="left")
+        self.arena_pal_sub1_entry = ttk.Combobox(
+            row_sub1, textvariable=self.arena_pal_sub1_var,
+            values=pal_names, width=20
+        )
+        self.arena_pal_sub1_entry.pack(side="left", padx=5)
+        self.arena_pal_sub1_entry.bind("<FocusOut>",
+            lambda e: self._on_arena_pal_validate(e, self.arena_pal_sub1_var, "辅助帕鲁1"))
+        self.arena_pal_sub1_entry.bind("<<ComboboxSelected>>", self._auto_save_arena)
+
+        row_sub2 = ttk.Frame(frame_pal)
+        row_sub2.pack(fill="x", pady=3)
+        ttk.Label(row_sub2, text="辅助帕鲁2:", width=10).pack(side="left")
+        self.arena_pal_sub2_entry = ttk.Combobox(
+            row_sub2, textvariable=self.arena_pal_sub2_var,
+            values=pal_names, width=20
+        )
+        self.arena_pal_sub2_entry.pack(side="left", padx=5)
+        self.arena_pal_sub2_entry.bind("<FocusOut>",
+            lambda e: self._on_arena_pal_validate(e, self.arena_pal_sub2_var, "辅助帕鲁2"))
+        self.arena_pal_sub2_entry.bind("<<ComboboxSelected>>", self._auto_save_arena)
+
+        # ---- 对手段位选择 ----
+        frame_tier = ttk.LabelFrame(parent, text="对手选择", padding=10)
+        frame_tier.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(frame_tier, text="选择对手段位:").pack(side="left")
+        self.arena_tier_var = tk.StringVar(value=ARENA_TIER)
+        tier_combo = ttk.Combobox(
+            frame_tier, textvariable=self.arena_tier_var,
+            values=["青铜", "白银", "黄金", "铂金", "钻石", "大师", "传奇"],
+            state="readonly", width=10
+        )
+        tier_combo.pack(side="left", padx=10)
+        tier_combo.bind("<<ComboboxSelected>>", self._auto_save_arena)
+
+        # ---- 缓存管理 ----
+        frame_arena_cache = ttk.LabelFrame(parent, text="缓存管理", padding=10)
+        frame_arena_cache.pack(fill="x", padx=10, pady=5)
+
+        ttk.Button(frame_arena_cache, text="清除截图缓存", command=self._clear_cache).pack(side="left", padx=5)
+
+        # ---- 热键设置 ----
+        frame_arena_hotkey = ttk.LabelFrame(parent, text="热键设置", padding=10)
+        frame_arena_hotkey.pack(fill="x", padx=10, pady=5)
+
+        self.arena_hotkey_btn = ttk.Button(
+            frame_arena_hotkey, text=f"热键: {_key_to_display(ARENA_HOTKEY)}",
+            command=self._start_bind_arena_hotkey, width=16
+        )
+        self.arena_hotkey_btn.pack(side="left", padx=5)
+        ttk.Label(frame_arena_hotkey, text="",
+                  foreground="gray").pack(side="left", padx=10)
+
+        # ---- 战斗时间设置 ----
+        frame_battle = ttk.LabelFrame(parent, text="战斗时间设置", padding=10)
+        frame_battle.pack(fill="x", padx=10, pady=5)
+
+        row_bt = ttk.Frame(frame_battle)
+        row_bt.pack(fill="x", pady=3)
+        ttk.Label(row_bt, text="帕鲁完战时间(秒):", width=18).pack(side="left")
+        self.arena_battle_time_var = tk.StringVar(value=str(ARENA_BATTLE_TIME))
+        battle_time_entry = ttk.Entry(row_bt, textvariable=self.arena_battle_time_var, width=8)
+        battle_time_entry.pack(side="left", padx=5)
+        battle_time_entry.bind("<FocusOut>", self._auto_save_arena)
+        ttk.Label(row_bt, text="(包含加载返回世界的耗时)", foreground="gray").pack(side="left", padx=5)
+
+        # ---- 控制区：启动/停止/保存 ----
+        frame_arena_ctrl = ttk.LabelFrame(parent, text="控制", padding=10)
+        frame_arena_ctrl.pack(fill="x", padx=10, pady=5)
+
+        self.btn_arena_start = ttk.Button(frame_arena_ctrl, text="启动竞技场", command=self._toggle_arena)
+        self.btn_arena_start.pack(side="left", padx=5)
+
+        ttk.Button(frame_arena_ctrl, text="停止", command=self._stop_arena).pack(side="left", padx=5)
+
+        self.arena_status_label = ttk.Label(frame_arena_ctrl, text="状态: 就绪", foreground="gray")
+        self.arena_status_label.pack(side="right", padx=10)
+
+        # ---- 竞技场日志 ----
+        frame_arena_log = ttk.LabelFrame(parent, text="竞技场日志", padding=5)
+        frame_arena_log.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.arena_log_text = tk.Text(frame_arena_log, height=12, wrap="word", font=("Consolas", 9))
+        arena_scrollbar = ttk.Scrollbar(frame_arena_log, orient="vertical", command=self.arena_log_text.yview)
+        self.arena_log_text.configure(yscrollcommand=arena_scrollbar.set)
+        self.arena_log_text.pack(side="left", fill="both", expand=True)
+        arena_scrollbar.pack(side="right", fill="y")
+
+        # 注册竞技场日志回调
+        global _arena_log_callback
+        _arena_log_callback = self._append_arena_log
+
+        # ---- 底部提示 ----
+        ahk_name = _key_to_display(ARENA_HOTKEY)
+        ttk.Label(
+            parent,
+            text=f"按 {ahk_name} 开始/停止竞技场",
+            foreground="blue"
+        ).pack(pady=3)
+
+    def _start_bind_arena_hotkey(self):
+        """开始绑定竞技场热键"""
+        global _arena_hotkey_binding
+        _arena_hotkey_binding = True
+        self.arena_hotkey_btn.config(text="请按键...")
+        log("等待设置竞技场热键... (按ESC取消热键)")
+
+    def _save_arena_config(self, silent=False):
+        """保存竞技场配置。silent=True时静默保存（仅写文件+verbose日志，不弹窗不显示UI）"""
+        global ARENA_PAL_MAIN, ARENA_PAL_SUB1, ARENA_PAL_SUB2
+        global ARENA_TIER, ARENA_BATTLE_TIME
+
+        # 验证帕鲁输入
+        if not self._validate_pal_input(self.arena_pal_main_var, "主战帕鲁"):
+            return
+        if not self._validate_pal_input(self.arena_pal_sub1_var, "辅助帕鲁1"):
+            return
+        if not self._validate_pal_input(self.arena_pal_sub2_var, "辅助帕鲁2"):
+            return
+
+        # 验证战斗时间
+        try:
+            bt = float(self.arena_battle_time_var.get())
+            if bt <= 0:
+                raise ValueError
+        except ValueError:
+            if not silent:
+                messagebox.showerror("错误", "完战时间必须是大于 0 的数字")
+            return
+
+        ARENA_PAL_MAIN = self.arena_pal_main_var.get().strip()
+        ARENA_PAL_SUB1 = self.arena_pal_sub1_var.get().strip()
+        ARENA_PAL_SUB2 = self.arena_pal_sub2_var.get().strip()
+        ARENA_TIER = self.arena_tier_var.get()
+        ARENA_BATTLE_TIME = bt
+        save_delays_config(verbose=silent)
+        if silent:
+            log(f"[竞技场] 静默保存: 主战={ARENA_PAL_MAIN} 辅助={ARENA_PAL_SUB1},{ARENA_PAL_SUB2} 段位={ARENA_TIER} 时间={ARENA_BATTLE_TIME}s", verbose=True)
+        else:
+            log(f"[竞技场] 配置已保存: 主战={ARENA_PAL_MAIN} 辅助={ARENA_PAL_SUB1},{ARENA_PAL_SUB2} 段位={ARENA_TIER} 时间={ARENA_BATTLE_TIME}s")
+
+    def _auto_save_arena(self, event=None):
+        """自动保存竞技场配置（静默，不弹窗不显示UI）"""
+        self._save_arena_config(silent=True)
+
+    def _toggle_arena(self):
+        """竞技场启动/停止切换"""
+        if _arena.running:
+            self._stop_arena()
+        else:
+            self._start_arena()
+
+    def _start_arena(self):
+        """启动竞技场"""
+        _arena.start()
+        self.arena_status_label.config(text="状态: 运行中", foreground="green")
+        self.root.iconify()
+
+    def _stop_arena(self):
+        """停止竞技场"""
+        _arena.stop()
+        self.arena_status_label.config(text="状态: 已停止", foreground="red")
+        self.root.deiconify()
+
+    def _append_arena_log(self, msg: str):
+        """追加竞技场日志到文本框"""
+        def _update():
+            self.arena_log_text.insert("end", msg + "\n")
+            self.arena_log_text.see("end")
+        self.root.after(0, _update)
 
     def _get_cache_size(self):
         """计算 screenshots 目录大小"""

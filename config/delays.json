@@ -13,5 +13,20 @@
         "step12_close_wait": 0.5,
         "time_restore_wait": 0.5
     },
-    "hotkey": "page_down"
+    "hotkey": "page_down",
+    "multi_destinations": [
+        "沙漠的隐秘遗迹",
+        "雪山的冻结洞穴",
+        null,
+        null,
+        null,
+        null
+    ],
+    "ocr_use_gpu": false,
+    "arena_hotkey": "page_up",
+    "arena_pal_main": "195b",
+    "arena_pal_sub1": "197",
+    "arena_pal_sub2": "201",
+    "arena_tier": "铂金",
+    "arena_battle_time": 40.0
 }
