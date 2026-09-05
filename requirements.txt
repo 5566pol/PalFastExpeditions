@@ -2,11 +2,14 @@ pyautogui>=0.9.54
 pynput>=1.7.6
 Pillow>=10.0.0
 numpy>=1.24.0
+opencv-python>=4.0.0
 onnxruntime-directml>=1.20.0
 rapidocr_onnxruntime>=1.4.0
+PyYAML>=6.0
 pyclipper>=1.2.0
 Shapely!=2.0.4,>=1.7.1
+six>=1.15.0
 tqdm
 colorama
-PyYAML>=6.0
+sympy
 pyinstaller>=6.0

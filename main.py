@@ -462,11 +462,34 @@ def log(msg: str, verbose: bool = False):
 # OCR 工具函数
 # ============================================================
 
+# OCR 工具函数
+# ============================================================
+
+
+_screenshot_origin = (0, 0)  # 截图在屏幕上的左上角坐标，用于将OCR坐标转为屏幕坐标
+
+
 def take_screenshot() -> np.ndarray:
-    """截取全屏，返回 OpenCV 格式的图像 (BGR)"""
+    """截取游戏窗口区域，找不到窗口则截全屏，返回 OpenCV 格式 (BGR)
+    同时更新 _screenshot_origin 以便 click_position 转换坐标。
+    """
+    global _screenshot_origin
+    hwnd = _find_game_window(_is_palworld_running())
+    if hwnd:
+        point = ctypes.wintypes.POINT(0, 0)
+        ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(point))
+        rect = ctypes.wintypes.RECT()
+        ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
+        l, t = point.x, point.y
+        r, b = l + rect.right, t + rect.bottom
+        if rect.right > 0 and rect.bottom > 0:
+            _screenshot_origin = (l, t)
+            screenshot = ImageGrab.grab(bbox=(l, t, r, b))
+            return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+    # 回退：截全屏，原点为(0,0)
+    _screenshot_origin = (0, 0)
     screenshot = ImageGrab.grab()
-    img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-    return img
+    return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
 
 
 def save_debug_screenshot(img: np.ndarray, name: str):
@@ -867,16 +890,20 @@ def _send_mouse_move(x: int, y: int):
 
 
 def click_position(x: int, y: int, duration: float = 0.2):
-    """移动鼠标到指定位置并点击（使用 SendInput 底层 API，兼容 DirectInput 游戏）"""
-    log(f"移动鼠标到 ({x}, {y}) 并点击", verbose=True)
+    """移动鼠标到指定位置并点击（使用 SendInput 底层 API，兼容 DirectInput 游戏）
+    x, y 是截图坐标，会自动加上 _screenshot_origin 转换为屏幕坐标。
+    """
+    screen_x = x + _screenshot_origin[0]
+    screen_y = y + _screenshot_origin[1]
+    log(f"移动鼠标到 ({screen_x}, {screen_y}) 并点击 [截图坐标 ({x},{y})]", verbose=True)
     # 先用 pyautogui 平滑移动（让玩家能看到光标）
     try:
-        pyautogui.moveTo(x, y, duration=duration)
+        pyautogui.moveTo(screen_x, screen_y, duration=duration)
     except Exception:
         pass
     time.sleep(0.05)
     # 用 SendInput 底层 API 点击（兼容 DirectInput 游戏）
-    _send_mouse_click(x, y)
+    _send_mouse_click(screen_x, screen_y)
 
 
 # ============================================================
@@ -989,14 +1016,62 @@ KEY_MAP = {
 }
 
 
-def _find_game_window():
-    """查找 Palworld 游戏窗口句柄"""
+def _find_game_window(pid: int = None):
+    """查找 Palworld 游戏窗口句柄
+    pid: 进程ID，优先按PID查找，找不到则按窗口标题查找
+    """
+    if pid:
+        result_hwnd = [0]
+        def _enum_cb(hwnd, _):
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            proc_id = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if proc_id.value == pid:
+                # 检查窗口有标题（排除工具窗口等）
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    result_hwnd[0] = hwnd
+                    return False  # 停止枚举
+            return True
+        cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+        ctypes.windll.user32.EnumWindows(cb(_enum_cb), 0)
+        if result_hwnd[0]:
+            return result_hwnd[0]
+    # 回退：按窗口标题查找
     hwnd = ctypes.windll.user32.FindWindowW(None, "Pal")
     if hwnd:
         return hwnd
-    # 备用查找
     hwnd = ctypes.windll.user32.FindWindowW(None, "Palworld")
     return hwnd
+
+
+def _is_palworld_running() -> int | None:
+    """检测 Palworld-Win64-Shipping.exe 是否正在运行，返回 PID 或 None"""
+    try:
+        result = os.popen('tasklist /FI "IMAGENAME eq Palworld-Win64-Shipping.exe" /NH').read()
+        if "Palworld-Win64-Shipping" not in result:
+            return None
+        # 提取 PID（第二列数字）
+        for line in result.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("Palworld"):
+                return int(parts[1])
+        return None
+    except Exception:
+        return None
+
+
+def _get_game_window_rect() -> tuple[int, int, int, int] | None:
+    """获取 Palworld 游戏窗口的位置和大小 (left, top, right, bottom)，找不到返回 None"""
+    pid = _is_palworld_running()
+    hwnd = _find_game_window(pid)
+    if not hwnd:
+        return None
+    rect = ctypes.wintypes.RECT()
+    if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return (rect.left, rect.top, rect.right, rect.bottom)
+    return None
 
 
 def _send_input_key(vk, scan):
@@ -1433,12 +1508,14 @@ class AutoExpedition:
         """
         dest = self.destination
 
-        screen_w, screen_h = pyautogui.size()
-        list_x, list_y = screen_w // 2, screen_h // 2
+        # 用截图中心作为列表中心（兼容非全屏）
+        img_ref = take_screenshot()
+        list_cx = img_ref.shape[1] // 2 + _screenshot_origin[0]
+        list_cy = img_ref.shape[0] // 2 + _screenshot_origin[1]
 
         def _move_and_scroll(notches):
             """只移动鼠标到列表中心（不点击），然后滚动"""
-            _send_mouse_move(list_x, list_y)
+            _send_mouse_move(list_cx, list_cy)
             time.sleep(0.1)
             log(f"滚动 {notches} 格", verbose=True)
             scroll_notches(notches)
@@ -1613,7 +1690,7 @@ class AutoArena:
     def _step1_click_challenge(self) -> bool:
         _arena_log("[步骤1] 按下F键")
         press_key("f")
-        time.sleep(0.3)
+        time.sleep(0.7)
         img = take_screenshot()
         save_debug_screenshot(img, "arena_step1")
         pos = find_text_position(img, "挑战")
@@ -1652,13 +1729,13 @@ class AutoArena:
         _arena_log(f"[步骤2] 点击段位 '{ARENA_TIER}' ({cx},{cy})")
         click_position(cx, cy)
         # 等待确认框
-        time.sleep(1)
+        time.sleep(1.5)
         img = take_screenshot()
         save_debug_screenshot(img, "arena_step2_confirm")
         pos2 = self._find_confirm_yes(img)
         if not pos2:
             _arena_log("[步骤2] 未找到确认按钮'是'，重试...")
-            time.sleep(1)
+            time.sleep(1.5)
             img = take_screenshot()
             save_debug_screenshot(img, "arena_step2_confirm_retry")
             pos2 = self._find_confirm_yes(img)
@@ -1680,14 +1757,17 @@ class AutoArena:
             ("辅助1", ARENA_PAL_SUB1, 1),  # 辅助最多重试1次
             ("辅助2", ARENA_PAL_SUB2, 1),
         ]
+        clicked_positions = []  # 已点击的坐标，防止重复选同一位置
         for role, pal_name, retries in pal_list:
             if not self.running:
                 return False
             if not pal_name:
                 continue
-            if not self._click_pal_in_list(pal_name, max_retries=retries):
+            pos = self._click_pal_in_list(pal_name, max_retries=retries, exclude=clicked_positions)
+            if not pos:
                 _arena_log(f"[步骤3] 未找到{role}帕鲁: {pal_name}")
                 return False
+            clicked_positions.append(pos)
             time.sleep(0.05)
         # 点击"准备完毕"
         time.sleep(0.1)
@@ -1725,10 +1805,14 @@ class AutoArena:
         pos2 = find_text_position(img, "是")
         return pos2
 
-    def _click_pal_in_list(self, pal_name: str, max_retries: int = 0) -> bool:
+    def _click_pal_in_list(self, pal_name: str, max_retries: int = 0, exclude: list = None, tolerance: int = 30) -> tuple | None:
         """在左侧帕鲁列表中找到并点击指定帕鲁（OCR模糊匹配，处理截断和错字）
         max_retries: 最大重试次数（每次重试会重新截图识别）
+        exclude: 已点击的坐标列表 [(x,y), ...]，会跳过距离这些坐标在 tolerance 像素内的结果
+        返回点击的坐标 (cx, cy) 或 None
         """
+        if exclude is None:
+            exclude = []
         # ID → 名称：如果传入的是编号(如"195b")，转成帕鲁名
         search_name = pal_name
         pal_id = pal_name  # 保留原始值用于文件名
@@ -1741,58 +1825,68 @@ class AutoArena:
                 break
         _arena_log(f"[帕鲁] 搜索 '{search_name}' (ID:{pal_id})", verbose=True)
 
-        screen_w, screen_h = pyautogui.size()
-        left_limit = screen_w // 2
-
         for attempt in range(1 + max_retries):
             img = take_screenshot()
             save_debug_screenshot(img, f"arena_pal_{pal_id}_{attempt}")
+            img_w = img.shape[1]
+            left_limit = img_w // 2
             items = _rapid_ocr(img)
             left_items = [i for i in items if i["left"] <= left_limit]
             _arena_log(f"[帕鲁] 左半屏识别到 {len(left_items)} 条: {[i['text'] for i in left_items]}", verbose=True)
 
-            best = None  # (score, item)
+            # 收集所有匹配候选
+            candidates = []
             for item in items:
                 if item["left"] > left_limit:
                     continue
                 text = item["text"]
-                # 完全包含
                 if search_name in text or text in search_name:
                     score = 100
-                # OCR截断：OCR结果是目标名的子串(如"贝拉"⊂"贝菈露洁")
                 elif len(text) >= 2 and text in search_name:
                     score = 80
-                # 字符重叠率：处理OCR错字
                 else:
                     overlap = len(set(search_name) & set(text))
                     ratio = overlap / len(search_name) if search_name else 0
                     score = int(ratio * 60) if ratio >= 0.5 else 0
-                if score > 0 and (best is None or score > best[0]):
-                    best = (score, item)
+                if score > 0:
+                    candidates.append((score, item))
 
-            if best:
-                _, item = best
-                cx = item["left"] + item["width"] // 2
-                cy = item["top"] + item["height"] // 2
+            # 按分数降序，跳过已点击坐标的附近
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            chosen = None
+            for score, item in candidates:
+                cx, cy = item["left"] + item["width"] // 2, item["top"] + item["height"] // 2
+                too_close = False
+                for ex, ey in exclude:
+                    if abs(cx - ex) < tolerance and abs(cy - ey) < tolerance:
+                        too_close = True
+                        _arena_log(f"[帕鲁] 跳过 '{item['text']}' ({cx},{cy}) — 与已选位置 ({ex},{ey}) 重叠", verbose=True)
+                        break
+                if not too_close:
+                    chosen = (cx, cy, item)
+                    break
+
+            if chosen:
+                cx, cy, item = chosen
                 ocr_text = item["text"]
                 _arena_log(f"[帕鲁] 点击 '{search_name}' (识别为'{ocr_text}') ({cx},{cy})")
                 click_position(cx, cy)
-                return True
+                return (cx, cy)
 
             if attempt < max_retries:
                 _arena_log(f"[帕鲁] '{search_name}' 未找到，重试 ({attempt + 1}/{max_retries})")
                 time.sleep(1)
 
         _arena_log(f"[帕鲁] 未找到 '{search_name}'")
-        return False
+        return None
 
     def _click_ready_button(self) -> bool:
         """点击我方（左侧）的蓝底白字'准备完毕'按钮（限制在左半屏搜索）"""
-        screen_w, screen_h = pyautogui.size()
-        # 搜索区域：左半屏的下半部分
-        left_region = (0, screen_h // 2, screen_w // 2, screen_h // 2)
         for attempt in range(3):
             img = take_screenshot()
+            img_h, img_w = img.shape[:2]
+            # 搜索区域：左半屏的下半部分（相对于截图坐标）
+            left_region = (0, img_h // 2, img_w // 2, img_h // 2)
             pos = find_text_position_in_region(img, "准备完毕", region=left_region)
             if pos:
                 cx, cy = pos[0] + pos[2] // 2, pos[1] + pos[3] // 2
@@ -1916,6 +2010,9 @@ class App:
         # 启动热键监听
         start_hotkey_listener()
 
+        # 启动游戏进程检测
+        self._check_game_process()
+
     def _build_ui(self):
         """构建 UI（Notebook 双标签页）"""
         # ---- Notebook 容器 ----
@@ -1979,6 +2076,10 @@ class App:
 
         self.status_label = ttk.Label(frame_mid, text="状态: 就绪", foreground="gray")
         self.status_label.pack(side="right", padx=10)
+
+        # ---- 游戏运行状态检测 ----
+        self.game_status_label = ttk.Label(frame_mid, text="游戏: 检测中...", foreground="gray")
+        self.game_status_label.pack(side="right", padx=10)
 
         # ---- RapidOCR 状态 ----
         frame_ocr = ttk.LabelFrame(tab1, text="OCR 引擎", padding=10)
@@ -2063,6 +2164,36 @@ class App:
 
         # ========== Tab2: 自动竞技场 ==========
         self._build_arena_tab(tab2)
+
+    def _check_game_process(self):
+        """定时检测游戏进程状态"""
+        pid = _is_palworld_running()
+        running = pid is not None
+        if running:
+            rect = _get_game_window_rect()
+            if rect:
+                l, t, r, b = rect
+                self.game_status_label.config(
+                    text=f"游戏: 运行中 ({r-l}x{b-t})", foreground="green")
+            else:
+                self.game_status_label.config(text="游戏: 运行中 (窗口未找到)", foreground="orange")
+        else:
+            self.game_status_label.config(text="游戏: 未运行", foreground="red")
+        # 状态变化时输出日志
+        if not hasattr(self, '_last_game_running'):
+            self._last_game_running = None
+        if self._last_game_running is not None and self._last_game_running != running:
+            if running:
+                rect = _get_game_window_rect()
+                if rect:
+                    l, t, r, b = rect
+                    log(f"Palworld 进程已启动 (PID: {pid}, 窗口: {l},{t},{r},{b} {r-l}x{b-t})")
+                else:
+                    log(f"Palworld 进程已启动 (PID: {pid}, 窗口未找到)")
+            else:
+                log("Palworld 进程已退出")
+        self._last_game_running = running
+        self.root.after(5000, self._check_game_process)
 
     def _setup_logging(self):
         """将日志输出到 UI"""
