@@ -22,11 +22,12 @@
         null,
         null
     ],
-    "ocr_use_gpu": false,
+    "ocr_use_gpu": true,
     "arena_hotkey": "page_up",
     "arena_pal_main": "195b",
     "arena_pal_sub1": "197",
-    "arena_pal_sub2": "201",
+    "arena_pal_sub2": "195b",
     "arena_tier": "铂金",
-    "arena_battle_time": 40.0
+    "arena_battle_time": 40.0,
+    "theme": "system"
 }
