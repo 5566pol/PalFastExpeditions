@@ -1,11 +1,19 @@
 @echo off
 chcp 65001 >nul 2>&1
-title PalFastExpeditions
 
+:: ========== 自动获取管理员权限 ==========
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [INFO] 正在请求管理员权限...
+    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs -WorkingDirectory '%~dp0'"
+    exit /b
+)
+
+title PalFastExpeditions
 cd /d "%~dp0"
 
 echo ========================================
-echo   PalFastExpeditions v0.2-beta
+echo   PalFastExpeditions v0.6-beta
 echo ========================================
 echo.
 

@@ -10,22 +10,31 @@ import threading
 import time
 import sys
 import os
-import tkinter as tk
-from tkinter import ttk, messagebox
 from datetime import datetime
 
 import cv2
 import numpy as np
 import pyautogui
+import urllib.request
+import ssl
 from rapidocr_onnxruntime import RapidOCR
 from pynput import keyboard
 from PIL import ImageGrab
+
+# 自动钓鱼模块 (暂时禁用)
+# from auto_fishing import AutoFishing, FishingConfig
+AutoFishing = None
+FishingConfig = None
+
+# UI 颜色常量（与 main_ui.py 保持一致）
+COLOR_SUCCESS = "#00b894"
+COLOR_DANGER = "#e94560"
 
 # ============================================================
 # 全局配置
 # ============================================================
 
-VERSION = "v0.5-beta"
+VERSION = "v0.6-beta"
 
 # RapidOCR 引擎 (ONNX Runtime, CPU/DirectML 加速)
 import onnxruntime as ort
@@ -121,6 +130,10 @@ _hotkey_binding = False  # True 时下一个按键将被设为热键
 ARENA_HOTKEY = keyboard.Key.page_up
 _arena_hotkey_binding = False  # True 时下一个按键将被设为竞技场热键
 
+# 钓鱼热键 (默认 F9，可自定义)
+FISHING_HOTKEY = keyboard.Key.f9
+_fishing_hotkey_binding = False  # True 时下一个按键将被设为钓鱼热键
+
 # 热键显示名称映射
 _KEY_DISPLAY = {
     'page_down': 'PageDown', 'page_up': 'PageUp',
@@ -171,6 +184,9 @@ def _hotkey_to_config(key):
 # 截图保存目录 (调试用)
 SCREENSHOT_DIR = "screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+# 主题配置 (system/light/dark)
+_theme_mode = "system"
 
 # PyAutoGUI 安全设置
 pyautogui.FAILSAFE = True  # 鼠标移到左上角可紧急停止
@@ -330,6 +346,18 @@ def load_delays_config():
                 ARENA_TIER = str(data["arena_tier"])
             if "arena_battle_time" in data:
                 ARENA_BATTLE_TIME = float(data["arena_battle_time"])
+            # 钓鱼热键
+            global FISHING_HOTKEY
+            if "fishing_hotkey" in data:
+                fhk = _parse_hotkey(data["fishing_hotkey"])
+                if fhk is not None or data["fishing_hotkey"] is None:
+                    FISHING_HOTKEY = fhk
+                print(f"[配置] 已加载钓鱼热键: {_key_to_display(FISHING_HOTKEY)}")
+            # 主题配置
+            global _theme_mode
+            if "theme" in data:
+                _theme_mode = str(data["theme"])
+                print(f"[配置] 已加载主题: {_theme_mode}")
         except Exception as e:
             print(f"[配置] 加载配置失败: {e}，使用默认值")
 
@@ -349,6 +377,8 @@ def save_delays_config(verbose=False):
                 "arena_pal_sub2": ARENA_PAL_SUB2,
                 "arena_tier": ARENA_TIER,
                 "arena_battle_time": ARENA_BATTLE_TIME,
+                "fishing_hotkey": _hotkey_to_config(FISHING_HOTKEY),
+                "theme": _theme_mode,
             }, f, ensure_ascii=False, indent=4)
         log(f"配置已保存: {DELAYS_PATH}", verbose=verbose)
     except Exception as e:
@@ -1906,12 +1936,26 @@ class AutoArena:
 
 _expedition = AutoExpedition()
 _arena = AutoArena()
+
+# 自动钓鱼 (暂时禁用)
+_fishing_config = FishingConfig() if FishingConfig else None
+_fishing_log_callback = None
+
+
+def _fishing_log(msg: str):
+    line = f"[钓鱼] {msg}"
+    print(line)
+    if _fishing_log_callback:
+        _fishing_log_callback(line)
+
+
+_auto_fishing = AutoFishing(config=_fishing_config, log_callback=_fishing_log) if AutoFishing else None
 _listener = None
 _app_ref = None  # App 实例引用（用于从监听线程更新 UI）
 
 
 def on_press(key):
-    global _expedition, _hotkey_binding, _arena_hotkey_binding
+    global _expedition, _hotkey_binding, _arena_hotkey_binding, _fishing_hotkey_binding
     try:
         if _hotkey_binding:
             if key == keyboard.Key.esc:
@@ -1920,7 +1964,6 @@ def on_press(key):
                 _apply_hotkey(key)
             _hotkey_binding = False
             return
-        # 竞技场热键
         if _arena_hotkey_binding:
             if key == keyboard.Key.esc:
                 _apply_arena_hotkey(None)
@@ -1928,26 +1971,43 @@ def on_press(key):
                 _apply_arena_hotkey(key)
             _arena_hotkey_binding = False
             return
-        # 远征热键：仅在自动远征 Tab 时响应
+        if _fishing_hotkey_binding:
+            if key == keyboard.Key.esc:
+                _apply_fishing_hotkey(None)
+            else:
+                _apply_fishing_hotkey(key)
+            _fishing_hotkey_binding = False
+            return
+        # 远征热键：仅在自动远征页面时响应
         if HOTKEY is not None and key == HOTKEY:
-            if _app_ref and _app_ref._current_tab != "expedition":
-                return  # 不在远征 Tab，忽略
+            if _app_ref and _app_ref._current_page != "expedition":
+                return
             if _expedition.running:
                 if _app_ref:
-                    _app_ref.root.after(0, _app_ref._stop)
+                    _app_ref.root.after(0, _app_ref._stop_expedition)
             else:
                 if _app_ref:
-                    _app_ref.root.after(0, _app_ref._start)
-        # 竞技场热键响应：仅在自动竞技场 Tab 时响应
+                    _app_ref.root.after(0, _app_ref._start_expedition)
+        # 竞技场热键：仅在自动竞技场页面时响应
         if ARENA_HOTKEY is not None and key == ARENA_HOTKEY:
-            if _app_ref and _app_ref._current_tab != "arena":
-                return  # 不在竞技场 Tab，忽略
+            if _app_ref and _app_ref._current_page != "arena":
+                return
             if _arena.running:
                 if _app_ref:
                     _app_ref.root.after(0, _app_ref._stop_arena)
             else:
                 if _app_ref:
                     _app_ref.root.after(0, _app_ref._start_arena)
+        # 钓鱼热键：仅在自动钓鱼页面时响应 (暂时禁用)
+        if _auto_fishing and FISHING_HOTKEY is not None and key == FISHING_HOTKEY:
+            if _app_ref and _app_ref._current_page != "fishing":
+                return
+            if _auto_fishing.is_running:
+                if _app_ref:
+                    _app_ref.root.after(0, _app_ref._stop_fishing)
+            else:
+                if _app_ref:
+                    _app_ref.root.after(0, _app_ref._toggle_fishing)
     except Exception as e:
         log(f"热键处理错误: {e}")
 
@@ -1959,9 +2019,8 @@ def _apply_hotkey(key):
     display = _key_to_display(key)
     save_delays_config()
     log(f"热键已设置为: {display}")
-    # 通过 after 在主线程更新 UI
     if _app_ref:
-        _app_ref.root.after(0, _app_ref._apply_hotkey_ui, key)
+        _app_ref.update_hotkey_display(display)
 
 
 def _apply_arena_hotkey(key):
@@ -1972,7 +2031,18 @@ def _apply_arena_hotkey(key):
     save_delays_config()
     log(f"竞技场热键已设置为: {display}")
     if _app_ref:
-        _app_ref.root.after(0, _app_ref._apply_arena_hotkey_ui, key)
+        _app_ref.update_arena_hotkey_display(display)
+
+
+def _apply_fishing_hotkey(key):
+    """应用新钓鱼热键（从 on_press 调用）"""
+    global FISHING_HOTKEY
+    FISHING_HOTKEY = key
+    display = _key_to_display(key)
+    save_delays_config()
+    log(f"钓鱼热键已设置为: {display}")
+    if _app_ref:
+        _app_ref.update_fishing_hotkey_display(display)
 
 
 def start_hotkey_listener():
@@ -1985,327 +2055,142 @@ def start_hotkey_listener():
 
 
 # ============================================================
-# GUI 界面
+# 新 UI 集成 (main_ui.py)
 # ============================================================
 
-class App:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title(f"PalFastExpeditions {VERSION}")
-        self.root.geometry("800x900")
-        self.root.resizable(True, True)
-        self._current_tab = "expedition"  # 当前活动标签页
+# ============================================================
+# 检查更新
+# ============================================================
 
-        # 设置图标和样式
-        style = ttk.Style()
-        style.theme_use("clam")
+_GITHUB_REPO = "5566pol/PalFastExpeditions"
+_GITHUB_API_URL = f"https://api.github.com/repos/{_GITHUB_REPO}/releases"
+_GITHUB_RELEASES_URL = f"https://github.com/{_GITHUB_REPO}/releases"
 
-        self._build_ui()
-        self._setup_logging()
 
-        # 保存 App 引用（供热键回调更新 UI）
-        global _app_ref
-        _app_ref = self
+def _parse_version(v: str) -> tuple:
+    """将版本号字符串解析为可比较的元组，如 'v0.4-beta' → (0, 4)"""
+    v = v.lstrip("v").split("-")[0]  # 去掉 'v' 前缀和 '-beta' 后缀
+    parts = v.split(".")
+    return tuple(int(p) for p in parts if p.isdigit())
 
-        # 启动热键监听
-        start_hotkey_listener()
 
-        # 启动游戏进程检测
-        self._check_game_process()
-
-    def _build_ui(self):
-        """构建 UI（Notebook 双标签页）"""
-        # ---- Notebook 容器 ----
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
-        tab1 = ttk.Frame(self.notebook)
-        tab2 = ttk.Frame(self.notebook)
-        self.notebook.add(tab1, text="  自动远征  ")
-        self.notebook.add(tab2, text="  自动竞技场  ")
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        # ---- 顶部：目的地选择 ----
-        frame_top = ttk.LabelFrame(tab1, text="目的地设置", padding=10)
-        frame_top.pack(fill="x", padx=10, pady=5)
-
-        ttk.Label(frame_top, text="选择远征目的地:").pack(side="left")
-
-        all_destinations = DESTINATIONS_PAGE1 + DESTINATIONS_PAGE2
-        combo_values = all_destinations + ["多选"]
-        self.dest_var = tk.StringVar(value=all_destinations[0])
-        dest_combo = ttk.Combobox(
-            frame_top, textvariable=self.dest_var,
-            values=combo_values, state="readonly", width=25
+def check_for_update(current_version: str, timeout: float = 10) -> dict:
+    """
+    检查 GitHub 仓库是否有新版本（含 pre-release）。
+    返回: {"available": bool, "latest": str, "url": str, "error": str|None}
+    """
+    result = {"available": False, "latest": "", "url": _GITHUB_RELEASES_URL, "error": None}
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            _GITHUB_API_URL,
+            headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "PalFastExpeditions"},
         )
-        dest_combo.pack(side="left", padx=10)
-        dest_combo.bind("<<ComboboxSelected>>", self._on_dest_change)
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        # 取第一个非 draft 的 release
+        release = None
+        for r in data:
+            if not r.get("draft"):
+                release = r
+                break
+        if release is None:
+            result["error"] = "没有找到发布版本"
+            return result
+        latest = release.get("tag_name", "")
+        result["latest"] = latest
+        result["url"] = release.get("html_url", _GITHUB_RELEASES_URL)
+        if latest and _parse_version(latest) > _parse_version(current_version):
+            result["available"] = True
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
-        # 多选设置按钮（默认隐藏）
-        self.multi_btn = ttk.Button(frame_top, text="多选设置", command=self._open_multi_settings)
-        # 初始状态：如果配置已保存了多选模式，显示按钮
-        if self.dest_var.get() == "多选":
-            self.multi_btn.pack(side="left", padx=5)
 
-        # 多选状态标签（第二行）
-        self.multi_status_label = ttk.Label(frame_top, text="", foreground="blue")
-        self.multi_status_label.pack(anchor="w", padx=(0, 0), pady=(3, 0))
-        self._update_multi_status()
+def _build_ui_config() -> dict:
+    """构建传递给 UI 的配置字典"""
+    return {
+        "version": VERSION,
+        "theme": _theme_mode,
+        "hotkey_display": _key_to_display(HOTKEY),
+        "arena_hotkey_display": _key_to_display(ARENA_HOTKEY),
+        "fishing_hotkey_display": _key_to_display(FISHING_HOTKEY),
+        "ocr_backend": _ocr_backend,
+        "ocr_use_gpu": _ocr_use_gpu,
+        "dml_available": _DML_AVAILABLE,
+        "destinations_page1": DESTINATIONS_PAGE1,
+        "destinations_page2": DESTINATIONS_PAGE2,
+        "current_destination": "草原的洞穴",
+        "multi_destinations": list(MULTI_DESTINATIONS),
+        "delays": dict(DELAYS),
+        "delay_labels": dict(DELAY_LABELS),
+        "default_delays": dict(DEFAULT_DELAYS),
+        "arena_pal_main": ARENA_PAL_MAIN,
+        "arena_pal_sub1": ARENA_PAL_SUB1,
+        "arena_pal_sub2": ARENA_PAL_SUB2,
+        "arena_tier": ARENA_TIER,
+        "arena_battle_time": ARENA_BATTLE_TIME,
+        "tiers": ["青铜", "白银", "黄金", "铂金", "钻石", "大师", "传奇"],
+        "pal_names": [p["name"] for p in PALS_LIST],
+        "config_dir": CONFIG_DIR,
+        "log_dir": LOG_DIR,
+        "screenshot_dir": SCREENSHOT_DIR,
+    }
 
-        # ---- 中部：控制按钮 ----
-        frame_mid = ttk.LabelFrame(tab1, text="控制", padding=10)
-        frame_mid.pack(fill="x", padx=10, pady=5)
 
-        self.btn_start = ttk.Button(frame_mid, text="开始", command=self._toggle)
-        self.btn_start.pack(side="left", padx=5)
+def _validate_pal_name(val: str) -> bool:
+    """验证帕鲁名称/编号是否有效"""
+    if not val:
+        return True
+    for pal in PALS_LIST:
+        if val == pal["id"] or val == pal["name"]:
+            return True
+    return False
 
-        ttk.Button(frame_mid, text="停止", command=self._stop).pack(side="left", padx=5)
 
-        # 自动重启勾选框
-        self.auto_restart_var = tk.BooleanVar(value=False)
-        self.auto_restart_cb = ttk.Checkbutton(
-            frame_mid, text="失败后自动重启", variable=self.auto_restart_var,
-            command=self._on_auto_restart_change
-        )
-        self.auto_restart_cb.pack(side="left", padx=15)
+def _run_game_status_check(app):
+    """定时检测游戏进程状态并更新 UI"""
+    pid = _is_palworld_running()
+    running = pid is not None
+    detail = ""
+    if running:
+        rect = _get_game_window_rect()
+        if rect:
+            l, t, r, b = rect
+            detail = f"{r-l}x{b-t}"
+    app.set_game_status(running, detail)
 
-        self.hotkey_btn = ttk.Button(
-            frame_mid, text=f"热键: {_key_to_display(HOTKEY)}",
-            command=self._start_bind_hotkey, width=16
-        )
-        self.hotkey_btn.pack(side="left", padx=15)
-
-        self.status_label = ttk.Label(frame_mid, text="状态: 就绪", foreground="gray")
-        self.status_label.pack(side="right", padx=10)
-
-        # ---- 游戏运行状态检测 ----
-        self.game_status_label = ttk.Label(frame_mid, text="游戏: 检测中...", foreground="gray")
-        self.game_status_label.pack(side="right", padx=10)
-
-        # ---- RapidOCR 状态 ----
-        frame_ocr = ttk.LabelFrame(tab1, text="OCR 引擎", padding=10)
-        frame_ocr.pack(fill="x", padx=10, pady=5)
-
-        self.ocr_status_label = ttk.Label(frame_ocr, text=f"RapidOCR ({_ocr_backend})", foreground="green")
-        self.ocr_status_label.pack(side="left")
-
-        # GPU/CPU 切换按钮（仅在 DirectML 可用时显示）
-        if _DML_AVAILABLE:
-            self.ocr_mode_var = tk.StringVar(value="GPU" if _ocr_use_gpu else "CPU")
-            ocr_combo = ttk.Combobox(
-                frame_ocr, textvariable=self.ocr_mode_var,
-                values=["GPU", "CPU"], state="readonly", width=6
-            )
-            ocr_combo.pack(side="left", padx=10)
-            ocr_combo.bind("<<ComboboxSelected>>", self._on_ocr_mode_change)
-        else:
-            ttk.Label(frame_ocr, text="(DirectML 不可用，仅 CPU)", foreground="gray").pack(side="left", padx=10)
-
-        # ---- 缓存管理 ----
-        frame_cache = ttk.LabelFrame(tab1, text="缓存管理", padding=10)
-        frame_cache.pack(fill="x", padx=10, pady=5)
-
-        ttk.Label(frame_cache, text=f"配置目录: {CONFIG_DIR}", foreground="gray").pack(anchor="w")
-
-        cache_sub = ttk.Frame(frame_cache)
-        cache_sub.pack(fill="x", pady=2)
-        self.cache_label = ttk.Label(cache_sub, text="截图缓存: 计算中...")
-        self.cache_label.pack(side="left")
-        ttk.Button(cache_sub, text="刷新", command=self._refresh_cache_size).pack(side="left", padx=10)
-        ttk.Button(cache_sub, text="清除缓存", command=self._clear_cache).pack(side="left", padx=5)
-
-        log_sub = ttk.Frame(frame_cache)
-        log_sub.pack(fill="x", pady=2)
-        self.log_size_label = ttk.Label(log_sub, text="日志文件: 计算中...")
-        self.log_size_label.pack(side="left")
-        ttk.Button(log_sub, text="打开日志目录", command=lambda: os.startfile(os.path.abspath(LOG_DIR))).pack(side="left", padx=10)
-
-        self._refresh_cache_size()
-
-        # ---- 延迟设置 ----
-        frame_delay = ttk.LabelFrame(tab1, text="延迟设置 (秒)", padding=10)
-        frame_delay.pack(fill="x", padx=10, pady=5)
-
-        self.delay_vars = {}
-        delay_keys = list(DELAY_LABELS.keys())
-        cols = 3
-        for i, key in enumerate(delay_keys):
-            row, col = divmod(i, cols)
-            sub = ttk.Frame(frame_delay)
-            sub.grid(row=row, column=col, padx=5, pady=2, sticky="w")
-            ttk.Label(sub, text=f"{DELAY_LABELS[key]}:").pack(side="left")
-            var = tk.StringVar(value=str(DELAYS[key]))
-            entry = ttk.Entry(sub, textvariable=var, width=6)
-            entry.pack(side="left", padx=3)
-            self.delay_vars[key] = var
-
-        btn_delay_frame = ttk.Frame(frame_delay)
-        btn_delay_frame.grid(row=divmod(len(delay_keys), cols)[0] + 1, column=0, columnspan=cols, pady=5)
-        ttk.Button(btn_delay_frame, text="保存延迟设置", command=self._save_delays).pack(side="left", padx=5)
-        ttk.Button(btn_delay_frame, text="恢复默认", command=self._reset_delays).pack(side="left", padx=5)
-
-        # ---- 底部：日志 ----
-        frame_log = ttk.LabelFrame(tab1, text="运行日志", padding=5)
-        frame_log.pack(fill="both", expand=True, padx=10, pady=5)
-
-        self.log_text = tk.Text(frame_log, height=15, wrap="word", font=("Consolas", 9))
-        scrollbar = ttk.Scrollbar(frame_log, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # ---- 底部提示 ----
-        hk_name = _key_to_display(HOTKEY)
-        self.tip_label = ttk.Label(
-            tab1,
-            text=f"按 {hk_name} 开始/停止",
-            foreground="blue"
-        )
-        self.tip_label.pack(pady=3)
-
-        # ========== Tab2: 自动竞技场 ==========
-        self._build_arena_tab(tab2)
-
-    def _check_game_process(self):
-        """定时检测游戏进程状态"""
-        pid = _is_palworld_running()
-        running = pid is not None
+    # 状态变化时输出日志
+    if not hasattr(_run_game_status_check, '_last'):
+        _run_game_status_check._last = None
+    if _run_game_status_check._last is not None and _run_game_status_check._last != running:
         if running:
-            rect = _get_game_window_rect()
-            if rect:
-                l, t, r, b = rect
-                self.game_status_label.config(
-                    text=f"游戏: 运行中 ({r-l}x{b-t})", foreground="green")
-            else:
-                self.game_status_label.config(text="游戏: 运行中 (窗口未找到)", foreground="orange")
+            log(f"Palworld 进程已启动 (PID: {pid})")
         else:
-            self.game_status_label.config(text="游戏: 未运行", foreground="red")
-        # 状态变化时输出日志
-        if not hasattr(self, '_last_game_running'):
-            self._last_game_running = None
-        if self._last_game_running is not None and self._last_game_running != running:
-            if running:
-                rect = _get_game_window_rect()
-                if rect:
-                    l, t, r, b = rect
-                    log(f"Palworld 进程已启动 (PID: {pid}, 窗口: {l},{t},{r},{b} {r-l}x{b-t})")
-                else:
-                    log(f"Palworld 进程已启动 (PID: {pid}, 窗口未找到)")
-            else:
-                log("Palworld 进程已退出")
-        self._last_game_running = running
-        self.root.after(5000, self._check_game_process)
+            log("Palworld 进程已退出")
+    _run_game_status_check._last = running
+    app.root.after(5000, lambda: _run_game_status_check(app))
 
-    def _setup_logging(self):
-        """将日志输出到 UI"""
-        global _log_callback
-        _log_callback = self._append_log
 
-    def _append_log(self, msg: str):
-        """追加日志到文本框"""
-        def _update():
-            self.log_text.insert("end", msg + "\n")
-            self.log_text.see("end")
-        self.root.after(0, _update)
+def create_app():
+    """创建并配置 UI 应用，返回 App 实例"""
+    from main_ui import App
 
-    def _on_dest_change(self, event=None):
-        """目的地变更"""
-        dest = self.dest_var.get()
-        if dest == "多选":
-            self.multi_btn.pack(side="left", padx=5)
-            self._update_multi_status()
-            log("已切换到多选模式")
-        else:
-            self.multi_btn.pack_forget()
-            self.multi_status_label.config(text="")
-            _expedition.multi_mode = False
-            _expedition.set_destination(dest)
-            log(f"目的地已切换为: {dest}")
+    config = _build_ui_config()
+    app = App(config)
 
-    def _update_multi_status(self):
-        """更新多选状态标签"""
-        active = [d for d in MULTI_DESTINATIONS if d]
-        if active:
-            display = " → ".join(active)
-            self.multi_status_label.config(text=f"队列: {display}", foreground="blue")
-        else:
-            self.multi_status_label.config(text="队列: [未设置]", foreground="gray")
+    # ---- 注册日志回调 ----
+    global _log_callback, _arena_log_callback
+    _log_callback = app.append_expedition_log
+    _arena_log_callback = app.append_arena_log
 
-    def _open_multi_settings(self):
-        """打开多选设置弹窗"""
-        win = tk.Toplevel(self.root)
-        win.title("多选目的地设置")
-        win.resizable(False, False)
-        win.grab_set()  # 模态窗口
+    # ---- 注册业务回调 ----
 
-        ttk.Label(win, text='设置远征目的地执行顺序(留空或选(无)表示跳过):',
-                  font=("", 9)).pack(padx=15, pady=(15, 5))
-
-        frame = ttk.Frame(win, padding=10)
-        frame.pack(fill="x", padx=10)
-
-        all_values = ["（无）"] + DESTINATIONS_PAGE1 + DESTINATIONS_PAGE2
-        combos = []
-
-        for i in range(6):
-            row_frame = ttk.Frame(frame)
-            row_frame.pack(fill="x", pady=3)
-            ttk.Label(row_frame, text=f"第 {i+1} 个:", width=8).pack(side="left")
-
-            # 当前值：从 MULTI_DESTINATIONS 读取
-            current = MULTI_DESTINATIONS[i] if MULTI_DESTINATIONS[i] else "（无）"
-            var = tk.StringVar(value=current)
-            combo = ttk.Combobox(row_frame, textvariable=var,
-                                values=all_values, state="readonly", width=25)
-            combo.pack(side="left", padx=5)
-            combos.append(var)
-
-        def _apply():
-            for i in range(6):
-                val = combos[i].get()
-                MULTI_DESTINATIONS[i] = None if val == "（无）" else val
-            save_delays_config()
-            self._update_multi_status()
-            active = [d for d in MULTI_DESTINATIONS if d]
-            log(f"多选目的地已更新: {' → '.join(active) if active else '（空）'}")
-            win.destroy()
-
-        btn_frame = ttk.Frame(win, padding=10)
-        btn_frame.pack(fill="x")
-        ttk.Button(btn_frame, text="确定", command=_apply).pack(side="right", padx=5)
-        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side="right", padx=5)
-
-        # 居中显示
-        win.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
-        win.geometry(f"+{x}+{y}")
-
-    def _toggle(self):
-        """切换开始/停止"""
-        if _expedition.running:
-            self._stop()
-        else:
-            self._start()
-
-    def _on_auto_restart_change(self):
-        """自动重启勾选框变更"""
-        _expedition.auto_restart = self.auto_restart_var.get()
+    def on_start_expedition():
+        global _expedition
         _expedition._user_stopped = False
-        status = "开启" if _expedition.auto_restart else "关闭"
-        log(f"失败后自动重启: {status}")
-
-    def _on_ocr_mode_change(self, event=None):
-        """OCR GPU/CPU 切换"""
-        use_gpu = self.ocr_mode_var.get() == "GPU"
-        _init_ocr_engine(use_gpu=use_gpu)
-        self.ocr_status_label.config(text=f"RapidOCR ({_ocr_backend})")
-
-    def _start(self):
-        """开始"""
-        _expedition._user_stopped = False  # 每次启动时重置
-        dest = self.dest_var.get()
-        if dest == "多选":
-            # 多选模式
+        dest = app.dest_var.get()
+        if dest == "多选模式":
             active = [d for d in MULTI_DESTINATIONS if d]
             if not active:
                 log('多选模式下未设置任何目的地，请先点击"多选设置"配置')
@@ -2313,347 +2198,168 @@ class App:
             _expedition.multi_mode = True
             _expedition.set_multi_destinations(active)
         else:
-            # 单选模式
             _expedition.multi_mode = False
             _expedition.set_destination(dest)
         _expedition.start()
-        self.status_label.config(text="状态: 运行中", foreground="green")
-        self.root.iconify()  # 最小化窗口
+        app._exp_running = True
+        app.set_expedition_status("▶ 运行中", COLOR_SUCCESS)
+        app.minimize()
 
-    def _stop(self):
-        """停止"""
+    def on_stop_expedition():
         _expedition.stop()
-        self.status_label.config(text="状态: 已停止", foreground="red")
-        self.root.deiconify()  # 恢复窗口
+        app._exp_running = False
+        app.set_expedition_status("⏹ 已停止", COLOR_DANGER)
+        app.restore()
 
-    def _start_bind_hotkey(self):
-        """开始绑定热键：下一个按键将设为热键"""
+    def on_start_arena():
+        _arena.start()
+        app._arena_running = True
+        app.set_arena_status("▶ 运行中", COLOR_SUCCESS)
+        app.minimize()
+
+    def on_stop_arena():
+        _arena.stop()
+        app._arena_running = False
+        app.set_arena_status("⏹ 已停止", COLOR_DANGER)
+        app.restore()
+
+    def on_dest_change(value):
+        if value == "多选模式":
+            log("已切换到多选模式")
+        else:
+            _expedition.multi_mode = False
+            _expedition.set_destination(value)
+            log(f"目的地已切换为: {value}")
+
+    def on_auto_restart_change(val):
+        _expedition.auto_restart = val
+        _expedition._user_stopped = False
+        log(f"失败后自动重启: {'开启' if val else '关闭'}")
+
+    def on_ocr_mode_change(use_gpu):
+        _init_ocr_engine(use_gpu=use_gpu)
+        app.set_ocr_status(_ocr_backend)
+
+    def on_save_delays(delay_vars):
+        global DELAYS
+        try:
+            for key, var in delay_vars.items():
+                val = float(var.get())
+                if val < 0:
+                    raise ValueError(f"{DELAY_LABELS[key]} 不能为负数")
+                DELAYS[key] = val
+            save_delays_config()
+            from tkinter import messagebox
+            messagebox.showinfo("成功", "延迟设置已保存")
+        except ValueError as e:
+            from tkinter import messagebox
+            messagebox.showerror("错误", f"输入无效: {e}")
+
+    def on_reset_delays(delay_vars):
+        global DELAYS
+        DELAYS = dict(DEFAULT_DELAYS)
+        for key, var in delay_vars.items():
+            var.set(str(DELAYS[key]))
+        save_delays_config()
+        log("延迟设置已恢复默认")
+
+    def on_bind_hotkey():
         global _hotkey_binding
         _hotkey_binding = True
-        self.hotkey_btn.config(text="请按键...")
         log("等待设置热键... (按ESC取消热键)")
 
-    def _apply_hotkey_ui(self, key):
-        """热键绑定完成后更新 UI"""
-        display = _key_to_display(key)
-        self.hotkey_btn.config(text=f"热键: {display}")
-        hk_name = _key_to_display(HOTKEY)
-        self.tip_label.config(
-            text=f"提示: 按 {hk_name} 开始/停止 | 确保以管理员权限运行 | 鼠标移到屏幕左上角可紧急停止"
-        )
-
-    # ---- 竞技场 Tab 相关方法 ----
-
-    def _on_tab_changed(self, event=None):
-        """标签页切换回调"""
-        tab_text = self.notebook.tab(self.notebook.select(), "text").strip()
-        if tab_text == "自动远征":
-            self._current_tab = "expedition"
-        elif tab_text == "自动竞技场":
-            self._current_tab = "arena"
-
-    def _apply_arena_hotkey_ui(self, key):
-        """竞技场热键绑定完成后更新 UI"""
-        display = _key_to_display(key)
-        self.arena_hotkey_btn.config(text=f"热键: {display}")
-
-    def _validate_pal_input(self, var, field_name):
-        """验证帕鲁输入：必须是 pals_list.json 中的 id 或 name"""
-        val = var.get().strip()
-        if not val:
-            return True  # 允许为空
-        # 检查是否是有效 id 或 name
-        for pal in PALS_LIST:
-            if val == pal["id"] or val == pal["name"]:
-                return True
-        messagebox.showwarning("输入无效", f"{field_name}：'{val}' 不在帕鲁图鉴中\n请输入有效的帕鲁编号(如 5)或名称(如 冲浪鸭)")
-        return False
-
-    def _on_arena_pal_validate(self, event, var, field_name):
-        """输入框失焦时验证并自动保存"""
-        self._validate_pal_input(var, field_name)
-        self._auto_save_arena()
-
-    def _build_arena_tab(self, parent):
-        """构建自动竞技场 Tab UI"""
-        # ---- 帕鲁选择 ----
-        frame_pal = ttk.LabelFrame(parent, text="帕鲁选择", padding=10)
-        frame_pal.pack(fill="x", padx=10, pady=5)
-
-        self.arena_pal_main_var = tk.StringVar(value=ARENA_PAL_MAIN)
-        self.arena_pal_sub1_var = tk.StringVar(value=ARENA_PAL_SUB1)
-        self.arena_pal_sub2_var = tk.StringVar(value=ARENA_PAL_SUB2)
-
-        pal_names = [p["name"] for p in PALS_LIST]
-
-        row_main = ttk.Frame(frame_pal)
-        row_main.pack(fill="x", pady=3)
-        ttk.Label(row_main, text="主战帕鲁:", width=10).pack(side="left")
-        self.arena_pal_main_entry = ttk.Combobox(
-            row_main, textvariable=self.arena_pal_main_var,
-            values=pal_names, width=20
-        )
-        self.arena_pal_main_entry.pack(side="left", padx=5)
-        self.arena_pal_main_entry.bind("<FocusOut>",
-            lambda e: self._on_arena_pal_validate(e, self.arena_pal_main_var, "主战帕鲁"))
-        self.arena_pal_main_entry.bind("<<ComboboxSelected>>", self._auto_save_arena)
-        ttk.Label(row_main, text="(输入帕鲁编号或名称)", foreground="gray").pack(side="left", padx=5)
-
-        row_sub1 = ttk.Frame(frame_pal)
-        row_sub1.pack(fill="x", pady=3)
-        ttk.Label(row_sub1, text="辅助帕鲁1:", width=10).pack(side="left")
-        self.arena_pal_sub1_entry = ttk.Combobox(
-            row_sub1, textvariable=self.arena_pal_sub1_var,
-            values=pal_names, width=20
-        )
-        self.arena_pal_sub1_entry.pack(side="left", padx=5)
-        self.arena_pal_sub1_entry.bind("<FocusOut>",
-            lambda e: self._on_arena_pal_validate(e, self.arena_pal_sub1_var, "辅助帕鲁1"))
-        self.arena_pal_sub1_entry.bind("<<ComboboxSelected>>", self._auto_save_arena)
-
-        row_sub2 = ttk.Frame(frame_pal)
-        row_sub2.pack(fill="x", pady=3)
-        ttk.Label(row_sub2, text="辅助帕鲁2:", width=10).pack(side="left")
-        self.arena_pal_sub2_entry = ttk.Combobox(
-            row_sub2, textvariable=self.arena_pal_sub2_var,
-            values=pal_names, width=20
-        )
-        self.arena_pal_sub2_entry.pack(side="left", padx=5)
-        self.arena_pal_sub2_entry.bind("<FocusOut>",
-            lambda e: self._on_arena_pal_validate(e, self.arena_pal_sub2_var, "辅助帕鲁2"))
-        self.arena_pal_sub2_entry.bind("<<ComboboxSelected>>", self._auto_save_arena)
-
-        # ---- 对手段位选择 ----
-        frame_tier = ttk.LabelFrame(parent, text="对手选择", padding=10)
-        frame_tier.pack(fill="x", padx=10, pady=5)
-
-        ttk.Label(frame_tier, text="选择对手段位:").pack(side="left")
-        self.arena_tier_var = tk.StringVar(value=ARENA_TIER)
-        tier_combo = ttk.Combobox(
-            frame_tier, textvariable=self.arena_tier_var,
-            values=["青铜", "白银", "黄金", "铂金", "钻石", "大师", "传奇"],
-            state="readonly", width=10
-        )
-        tier_combo.pack(side="left", padx=10)
-        tier_combo.bind("<<ComboboxSelected>>", self._auto_save_arena)
-
-        # ---- 缓存管理 ----
-        frame_arena_cache = ttk.LabelFrame(parent, text="缓存管理", padding=10)
-        frame_arena_cache.pack(fill="x", padx=10, pady=5)
-
-        ttk.Button(frame_arena_cache, text="清除截图缓存", command=self._clear_cache).pack(side="left", padx=5)
-
-        # ---- 热键设置 ----
-        frame_arena_hotkey = ttk.LabelFrame(parent, text="热键设置", padding=10)
-        frame_arena_hotkey.pack(fill="x", padx=10, pady=5)
-
-        self.arena_hotkey_btn = ttk.Button(
-            frame_arena_hotkey, text=f"热键: {_key_to_display(ARENA_HOTKEY)}",
-            command=self._start_bind_arena_hotkey, width=16
-        )
-        self.arena_hotkey_btn.pack(side="left", padx=5)
-        ttk.Label(frame_arena_hotkey, text="",
-                  foreground="gray").pack(side="left", padx=10)
-
-        # ---- 战斗时间设置 ----
-        frame_battle = ttk.LabelFrame(parent, text="战斗时间设置", padding=10)
-        frame_battle.pack(fill="x", padx=10, pady=5)
-
-        row_bt = ttk.Frame(frame_battle)
-        row_bt.pack(fill="x", pady=3)
-        ttk.Label(row_bt, text="帕鲁完战时间(秒):", width=18).pack(side="left")
-        self.arena_battle_time_var = tk.StringVar(value=str(ARENA_BATTLE_TIME))
-        battle_time_entry = ttk.Entry(row_bt, textvariable=self.arena_battle_time_var, width=8)
-        battle_time_entry.pack(side="left", padx=5)
-        battle_time_entry.bind("<FocusOut>", self._auto_save_arena)
-        ttk.Label(row_bt, text="(包含加载返回世界的耗时)", foreground="gray").pack(side="left", padx=5)
-
-        # ---- 控制区：启动/停止/保存 ----
-        frame_arena_ctrl = ttk.LabelFrame(parent, text="控制", padding=10)
-        frame_arena_ctrl.pack(fill="x", padx=10, pady=5)
-
-        self.btn_arena_start = ttk.Button(frame_arena_ctrl, text="启动竞技场", command=self._toggle_arena)
-        self.btn_arena_start.pack(side="left", padx=5)
-
-        ttk.Button(frame_arena_ctrl, text="停止", command=self._stop_arena).pack(side="left", padx=5)
-
-        self.arena_status_label = ttk.Label(frame_arena_ctrl, text="状态: 就绪", foreground="gray")
-        self.arena_status_label.pack(side="right", padx=10)
-
-        # ---- 竞技场日志 ----
-        frame_arena_log = ttk.LabelFrame(parent, text="竞技场日志", padding=5)
-        frame_arena_log.pack(fill="both", expand=True, padx=10, pady=5)
-
-        self.arena_log_text = tk.Text(frame_arena_log, height=12, wrap="word", font=("Consolas", 9))
-        arena_scrollbar = ttk.Scrollbar(frame_arena_log, orient="vertical", command=self.arena_log_text.yview)
-        self.arena_log_text.configure(yscrollcommand=arena_scrollbar.set)
-        self.arena_log_text.pack(side="left", fill="both", expand=True)
-        arena_scrollbar.pack(side="right", fill="y")
-
-        # 注册竞技场日志回调
-        global _arena_log_callback
-        _arena_log_callback = self._append_arena_log
-
-        # ---- 底部提示 ----
-        ahk_name = _key_to_display(ARENA_HOTKEY)
-        ttk.Label(
-            parent,
-            text=f"按 {ahk_name} 开始/停止竞技场",
-            foreground="blue"
-        ).pack(pady=3)
-
-    def _start_bind_arena_hotkey(self):
-        """开始绑定竞技场热键"""
+    def on_bind_arena_hotkey():
         global _arena_hotkey_binding
         _arena_hotkey_binding = True
-        self.arena_hotkey_btn.config(text="请按键...")
         log("等待设置竞技场热键... (按ESC取消热键)")
 
-    def _save_arena_config(self, silent=False):
-        """保存竞技场配置。silent=True时静默保存（仅写文件+verbose日志，不弹窗不显示UI）"""
-        global ARENA_PAL_MAIN, ARENA_PAL_SUB1, ARENA_PAL_SUB2
-        global ARENA_TIER, ARENA_BATTLE_TIME
+    def on_bind_fishing_hotkey():
+        global _fishing_hotkey_binding
+        _fishing_hotkey_binding = True
+        log("等待设置钓鱼热键... (按ESC取消热键)")
 
-        # 验证帕鲁输入
-        if not self._validate_pal_input(self.arena_pal_main_var, "主战帕鲁"):
-            return
-        if not self._validate_pal_input(self.arena_pal_sub1_var, "辅助帕鲁1"):
-            return
-        if not self._validate_pal_input(self.arena_pal_sub2_var, "辅助帕鲁2"):
-            return
-
-        # 验证战斗时间
-        try:
-            bt = float(self.arena_battle_time_var.get())
-            if bt <= 0:
-                raise ValueError
-        except ValueError:
-            if not silent:
-                messagebox.showerror("错误", "完战时间必须是大于 0 的数字")
-            return
-
-        ARENA_PAL_MAIN = self.arena_pal_main_var.get().strip()
-        ARENA_PAL_SUB1 = self.arena_pal_sub1_var.get().strip()
-        ARENA_PAL_SUB2 = self.arena_pal_sub2_var.get().strip()
-        ARENA_TIER = self.arena_tier_var.get()
-        ARENA_BATTLE_TIME = bt
-        save_delays_config(verbose=silent)
-        if silent:
-            log(f"[竞技场] 静默保存: 主战={ARENA_PAL_MAIN} 辅助={ARENA_PAL_SUB1},{ARENA_PAL_SUB2} 段位={ARENA_TIER} 时间={ARENA_BATTLE_TIME}s", verbose=True)
-        else:
-            log(f"[竞技场] 配置已保存: 主战={ARENA_PAL_MAIN} 辅助={ARENA_PAL_SUB1},{ARENA_PAL_SUB2} 段位={ARENA_TIER} 时间={ARENA_BATTLE_TIME}s")
-
-    def _auto_save_arena(self, event=None):
-        """自动保存竞技场配置（静默，不弹窗不显示UI）"""
-        self._save_arena_config(silent=True)
-
-    def _toggle_arena(self):
-        """竞技场启动/停止切换"""
-        if _arena.running:
-            self._stop_arena()
-        else:
-            self._start_arena()
-
-    def _start_arena(self):
-        """启动竞技场"""
-        _arena.start()
-        self.arena_status_label.config(text="状态: 运行中", foreground="green")
-        self.root.iconify()
-
-    def _stop_arena(self):
-        """停止竞技场"""
-        _arena.stop()
-        self.arena_status_label.config(text="状态: 已停止", foreground="red")
-        self.root.deiconify()
-
-    def _append_arena_log(self, msg: str):
-        """追加竞技场日志到文本框"""
-        def _update():
-            self.arena_log_text.insert("end", msg + "\n")
-            self.arena_log_text.see("end")
-        self.root.after(0, _update)
-
-    def _get_cache_size(self):
-        """计算 screenshots 目录大小"""
-        total = 0
-        count = 0
+    def on_clear_cache():
+        total, count = 0, 0
         if os.path.isdir(SCREENSHOT_DIR):
             for f in os.listdir(SCREENSHOT_DIR):
                 fp = os.path.join(SCREENSHOT_DIR, f)
                 if os.path.isfile(fp):
                     total += os.path.getsize(fp)
                     count += 1
-        return total, count
-
-    def _format_size(self, size_bytes):
-        """格式化文件大小"""
-        if size_bytes < 1024:
-            return f"{size_bytes} B"
-        elif size_bytes < 1024 * 1024:
-            return f"{size_bytes / 1024:.1f} KB"
-        else:
-            return f"{size_bytes / (1024 * 1024):.1f} MB"
-
-    def _refresh_cache_size(self):
-        """刷新缓存大小和日志文件大小显示"""
-        total, count = self._get_cache_size()
-        self.cache_label.config(text=f"截图缓存: {count} 个文件, {self._format_size(total)}")
-        # 日志文件大小
-        log_total = 0
-        log_count = 0
-        if os.path.isdir(LOG_DIR):
-            for f in os.listdir(LOG_DIR):
-                fp = os.path.join(LOG_DIR, f)
-                if os.path.isfile(fp) and f.endswith(".log"):
-                    log_total += os.path.getsize(fp)
-                    log_count += 1
-        self.log_size_label.config(text=f"日志: {log_count} 个文件, {self._format_size(log_total)}")
-
-    def _clear_cache(self):
-        """清除截图缓存"""
-        total, count = self._get_cache_size()
         if count == 0:
-            messagebox.showinfo("提示", "缓存已经是空的")
             return
-        if messagebox.askyesno("确认", f"确定删除 {count} 个截图文件 ({self._format_size(total)})？"):
-            deleted = 0
-            for f in os.listdir(SCREENSHOT_DIR):
-                fp = os.path.join(SCREENSHOT_DIR, f)
-                if os.path.isfile(fp):
-                    try:
-                        os.remove(fp)
-                        deleted += 1
-                    except Exception:
-                        pass
-            log(f"已清除 {deleted} 个截图缓存文件")
-            self._refresh_cache_size()
+        deleted = 0
+        for f in os.listdir(SCREENSHOT_DIR):
+            fp = os.path.join(SCREENSHOT_DIR, f)
+            if os.path.isfile(fp):
+                try:
+                    os.remove(fp)
+                    deleted += 1
+                except Exception:
+                    pass
+        log(f"已清除 {deleted} 个截图缓存文件")
 
-    def _save_delays(self):
-        """保存延迟设置"""
-        global DELAYS
-        try:
-            for key, var in self.delay_vars.items():
-                val = float(var.get())
-                if val < 0:
-                    raise ValueError(f"{DELAY_LABELS[key]} 不能为负数")
-                DELAYS[key] = val
-            save_delays_config()
-            messagebox.showinfo("成功", "延迟设置已保存")
-        except ValueError as e:
-            messagebox.showerror("错误", f"输入无效: {e}")
+    # 绑定回调
+    app.on_start_expedition = on_start_expedition
+    app.on_stop_expedition = on_stop_expedition
+    app.on_start_arena = on_start_arena
+    app.on_stop_arena = on_stop_arena
+    app.on_dest_change = on_dest_change
+    app.on_auto_restart_change = on_auto_restart_change
+    app.on_ocr_mode_change = on_ocr_mode_change
+    app.on_save_delays = on_save_delays
+    app.on_reset_delays = on_reset_delays
+    app.on_bind_hotkey = on_bind_hotkey
+    app.on_bind_arena_hotkey = on_bind_arena_hotkey
+    app.on_bind_fishing_hotkey = on_bind_fishing_hotkey
+    app.on_clear_cache = on_clear_cache
 
-    def _reset_delays(self):
-        """恢复默认延迟"""
-        global DELAYS
-        DELAYS = dict(DEFAULT_DELAYS)
-        for key, var in self.delay_vars.items():
-            var.set(str(DELAYS[key]))
-        save_delays_config()
-        log("延迟设置已恢复默认")
+    def on_theme_change(theme):
+        global _theme_mode
+        _theme_mode = theme
+        save_delays_config(verbose=True)
+        log(f"主题已切换为: {theme}")
 
-    def run(self):
-        """运行 GUI"""
-        self.root.mainloop()
+    app.on_theme_change = on_theme_change
+
+    def on_check_update():
+        """在后台线程检查更新，完成后回调 UI"""
+        def _do_check():
+            result = check_for_update(VERSION)
+            app.root.after(0, lambda: app.show_update_result(result))
+        threading.Thread(target=_do_check, daemon=True).start()
+
+    app.on_check_update = on_check_update
+
+    # ---- 自动钓鱼回调 (暂时禁用) ----
+    # global _fishing_log_callback
+    # _fishing_log_callback = app.append_fishing_log
+
+    def on_start_fishing():
+        if not _auto_fishing:
+            return
+        def _on_fishing_end():
+            app.root.after(0, lambda: app.set_fishing_status("已停止", COLOR_DANGER))
+            app.root.after(0, lambda: setattr(app, '_fishing_running', False))
+            app.root.after(0, lambda: app.fishing_btn_start.configure(text="▶ 启动"))
+        _auto_fishing._on_end_callback = _on_fishing_end
+        _auto_fishing.start()
+        app.set_fishing_status("运行中", COLOR_SUCCESS)
+
+    def on_stop_fishing():
+        if not _auto_fishing:
+            return
+        _auto_fishing.stop()
+        app.set_fishing_status("已停止", COLOR_DANGER)
+
+    app.on_start_fishing = on_start_fishing
+    app.on_stop_fishing = on_stop_fishing
+
+    # 保存 App 引用（供热键回调使用）
+    global _app_ref
+    _app_ref = app
+
+    return app
 
 
 # ============================================================
@@ -2699,12 +2405,13 @@ if __name__ == "__main__":
     log(f"管理员权限: {_is_admin}")
     log(f"配置目录: {CONFIG_DIR}")
 
-    app = App()
+    app = create_app()
+    start_hotkey_listener()
+    _run_game_status_check(app)
     try:
         app.run()
     finally:
         log("===== 会话结束 =====")
-        # 关闭日志文件
         if _log_file:
             try:
                 _log_file.close()
