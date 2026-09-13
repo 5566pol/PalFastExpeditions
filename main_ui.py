@@ -368,7 +368,7 @@ class App:
 
         # 底部提示
         ctk.CTkLabel(
-            scroll, text=f"按 {self.config['hotkey_display']} 开始/停止  |  鼠标移到屏幕左上角紧急停止",
+            scroll, text=f"按 {self.config['hotkey_display']} 开始/停止",
             font=ctk.CTkFont(size=11), text_color=C["text_dim"],
         ).pack(pady=(5, 0))
 
