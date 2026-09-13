@@ -822,8 +822,11 @@ class App:
         if hasattr(self, '_arena_running') and self._arena_running:
             self._stop_arena()
         else:
-            if self.on_start_arena:
-                self.on_start_arena()
+            self._start_arena()
+
+    def _start_arena(self):
+        if self.on_start_arena:
+            self.on_start_arena()
 
     def _stop_arena(self):
         if self.on_stop_arena:
